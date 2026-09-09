@@ -41,7 +41,7 @@ INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "3"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 
 # Only alert if the computed risk score is at least this high (0-100).
-MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "40"))
+MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "50"))
 
 # ---------------------------------------------------------------------------
 # Keyword / query strategy
