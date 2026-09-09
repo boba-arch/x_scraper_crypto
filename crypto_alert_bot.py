@@ -30,18 +30,18 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "45"))
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 
 # On first startup only (no since_id yet), how far back to look so we don't
 # miss anything but also don't backfill hours of history.
-INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "5"))
+INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "3"))
 
 # Hard cap on how many tweets we pull per poll — mainly a safety ceiling for
 # traffic bursts, since since_id tracking already prevents re-reads.
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
 
 # Only alert if the computed risk score is at least this high (0-100).
-MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
+MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "40"))
 
 # ---------------------------------------------------------------------------
 # Keyword / query strategy
@@ -65,7 +65,7 @@ CRYPTO_CONTEXT_TERMS = [
 TRUSTED_ACCOUNTS = {
     "zachxbt", "peckshieldalert", "peckshield", "officer_cia",
     "certikalert", "certik", "slowmist_team", "cyversealerts",
-    "bitcoin_infoBTC", "whale_alert",
+    "bitcoin_infoBTC", "whale_alert","SlowMist_Team","blockaid_",
 }
 
 # Words that indicate the incident is resolved/false-positive/hypothetical —
