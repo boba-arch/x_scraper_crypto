@@ -30,7 +30,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "90"))
 
 # On first startup only (no since_id yet), how far back to look so we don't
 # miss anything but also don't backfill hours of history.
