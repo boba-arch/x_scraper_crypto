@@ -109,6 +109,75 @@ If you'd rather have flat, predictable billing:
 
 ---
 
+## Testing before you rely on it
+
+Real hack tweets don't happen on a schedule, so test the pipeline in
+layers rather than just waiting and hoping. Do these in order — each one
+catches a different type of mistake.
+
+### Test 1 — Is your Telegram bot token/chat ID correct? (2 minutes, no bot needed)
+
+Paste this into your **browser's address bar**, with your real values swapped in:
+
+```
+https://api.telegram.org/bot<YOUR_BOT_TOKEN>/sendMessage?chat_id=<YOUR_CHAT_ID>&text=hello
+```
+
+If it's set up right, you'll immediately get a "hello" message in your
+Telegram chat, and the browser will show `"ok":true`. If not, the browser
+response will tell you what's wrong (wrong token, bot not in the chat,
+wrong chat ID, etc.) — fix that before moving on.
+
+### Test 2 — Is your X API bearer token valid? (2 minutes)
+
+Open **Windows PowerShell** (search for it in the Start menu — you're just
+pasting one line, not writing code) and run, with your token swapped in:
+
+```powershell
+Invoke-RestMethod -Uri "https://api.twitter.com/2/tweets/search/recent?query=bitcoin" -Headers @{Authorization="Bearer YOUR_X_BEARER_TOKEN"}
+```
+
+If it works, you'll see a block of tweet data print out. If your token or
+billing setup is wrong, you'll get a clear error (401 = bad token, 403 =
+billing/access issue) instead.
+
+### Test 3 — Full pipeline test, using the bot itself (5 minutes)
+
+I've built a self-test into the bot so you don't have to wait for a real
+hack to confirm everything works end-to-end (search → scoring →
+translation → Telegram formatting).
+
+1. In Railway (or Render), add one more environment variable:
+   `SELF_TEST_ON_START` = `true`
+2. Redeploy / restart the service.
+3. Check the logs — you should see `Running self-test...` then
+   `Self-test message sent.`
+4. Check your Telegram chat — you should receive a message starting with
+   **"🧪 SELF-TEST — not a real incident"**, showing a sample risk score,
+   English text, and Chinese translation. This confirms scoring,
+   translation, and Telegram delivery all work correctly.
+5. **Turn `SELF_TEST_ON_START` back to `false`** (or delete the variable)
+   afterward — otherwise it'll send a test message every time the service
+   restarts, which will clutter your real alerts.
+
+### Test 4 — Confirm it catches real tweets (ongoing)
+
+Once Tests 1–3 pass, the last thing to confirm is that it's actually
+finding real matching tweets, not just capable of sending test ones.
+Two ways to do this without waiting indefinitely:
+
+- **Temporarily lower the bar**: set `MIN_RISK_SCORE_TO_ALERT` to `1` for
+  15–20 minutes. Crypto Twitter is noisy enough that you'll likely see at
+  least one real alert (even a low-severity one) come through, confirming
+  the search itself works. Then set it back to your real threshold (e.g.
+  25 or 45).
+- **Check the logs directly**: Railway/Render logs will print a line like
+  `3 new candidate tweet(s)` whenever the search finds anything, even if
+  none of them score high enough to alert — so the logs alone tell you the
+  search is actively working, independent of your alert threshold.
+
+---
+
 ## Tuning it to your risk appetite
 
 All of these are environment variables — edit them directly in Railway's
@@ -130,9 +199,13 @@ add specific chains/protocols you care about.
 
 ## Important caveats
 
-- **Translation**: uses a free, unofficial Google Translate endpoint —
+- **Translation**: uses two free, keyless services as a primary/fallback
+  pair (Google Translate's public endpoint, then MyMemory if that fails) —
   good for a quick read, not guaranteed to stay up or be perfectly
   accurate. Verify against the English original before citing in a report.
+  If you ever see "(translation unavailable — see logs)" in an alert,
+  check the Railway/Render logs — they'll print the actual underlying
+  error from both providers, which tells you exactly what broke.
 - **Risk score is a triage heuristic, not a verified assessment.** Built
   from keyword severity, trusted-account matching, and engagement —
   useful for prioritization, not a substitute for your own verification

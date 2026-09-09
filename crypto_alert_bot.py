@@ -196,10 +196,13 @@ def score_risk(tweet: dict) -> tuple[int, str]:
 
 def translate_to_chinese(text: str) -> str:
     """
-    Simple, dependency-light translation using Google's public translate
-    endpoint via a plain HTTP request (no API key required, best-effort).
-    For production reliability, swap this for a paid translation API.
+    Translates to Simplified Chinese using a free, keyless endpoint, with a
+    second free provider as fallback if the first fails. Both are
+    best-effort public services (not paid, no SLA) — for guaranteed
+    reliability at scale, swap this for a paid translation API.
     """
+    # Primary: Google Translate's public endpoint, with a browser-like
+    # User-Agent — some hosts get silently rejected without one.
     try:
         resp = requests.get(
             "https://translate.googleapis.com/translate_a/single",
@@ -210,14 +213,38 @@ def translate_to_chinese(text: str) -> str:
                 "dt": "t",
                 "q": text,
             },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36"
+            },
             timeout=15,
         )
         resp.raise_for_status()
         segments = resp.json()[0]
-        return "".join(seg[0] for seg in segments if seg[0])
+        translated = "".join(seg[0] for seg in segments if seg[0])
+        if translated.strip():
+            return translated
     except Exception as e:
-        print(f"Translation failed: {e}", file=sys.stderr)
-        return "(translation unavailable)"
+        print(f"Primary translation (Google) failed: {e}", file=sys.stderr)
+
+    # Fallback: MyMemory's free translation API (no key required, rate
+    # limited but fine for occasional fallback use).
+    try:
+        resp = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text, "langpair": "en|zh-CN"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        translated = data.get("responseData", {}).get("translatedText", "")
+        if translated.strip():
+            return translated
+    except Exception as e:
+        print(f"Fallback translation (MyMemory) failed: {e}", file=sys.stderr)
+
+    return "(translation unavailable — see logs for the underlying error)"
 
 
 def send_telegram_alert(message: str):
@@ -253,6 +280,32 @@ def format_alert(tweet: dict, score: int, label: str, zh_text: str) -> str:
     return msg
 
 
+def run_self_test():
+    """
+    Sends one fake, clearly-labeled TEST alert through the full pipeline
+    (scoring, translation, Telegram formatting) so you can verify everything
+    is wired correctly without waiting for a real incident tweet.
+    Triggered by setting SELF_TEST_ON_START=true.
+    """
+    print("Running self-test: sending a sample alert through the full pipeline...")
+    fake_tweet = {
+        "id": "0000000000000000000",
+        "text": "TEST ALERT: This is a sample tweet simulating a wallet drained "
+                "in a DeFi exploit, used only to verify your bot setup.",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "metrics": {"like_count": 123, "retweet_count": 45},
+        "username": "test_account",
+        "name": "Self-Test",
+    }
+    score, label = score_risk(fake_tweet)
+    zh_text = translate_to_chinese(fake_tweet["text"])
+    message = "🧪 <b>SELF-TEST — not a real incident</b>\n\n" + format_alert(
+        fake_tweet, score, label, zh_text
+    )
+    send_telegram_alert(message)
+    print("Self-test message sent. Check your Telegram chat now.")
+
+
 def run_once(since_id):
     tweets, newest_id = search_recent_tweets(since_id)
     if tweets:
@@ -279,6 +332,9 @@ def main():
         print("ERROR: Missing one or more required env vars: X_BEARER_TOKEN, "
               "TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.", file=sys.stderr)
         sys.exit(1)
+
+    if os.environ.get("SELF_TEST_ON_START", "false").lower() == "true":
+        run_self_test()
 
     since_id = None
     while True:
