@@ -353,16 +353,25 @@ def run_once(since_id):
     for tweet in tweets:
         metrics = tweet.get("metrics", {})
         likes = metrics.get("like_count", 0)
-        if likes < MIN_ENGAGEMENT_FILTER:
-            continue  # below engagement floor — skip, reduces alert noise
-
         score, label = score_risk(tweet)
-        if score < MIN_RISK_SCORE_TO_ALERT:
+        preview = tweet["text"][:80].replace("\n", " ")
+
+        # Always log the score, even for tweets that won't alert — this is
+        # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
+        # MIN_ENGAGEMENT_FILTER against real traffic.
+        print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
+
+        if likes < MIN_ENGAGEMENT_FILTER:
+            print(f"    -> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
             continue
+        if score < MIN_RISK_SCORE_TO_ALERT:
+            print(f"    -> skipped (below MIN_RISK_SCORE_TO_ALERT={MIN_RISK_SCORE_TO_ALERT})")
+            continue
+
         zh_text = translate_to_chinese(tweet["text"])
         message = format_alert(tweet, score, label, zh_text)
         send_telegram_alert(message)
-        print(f"  -> Alert sent: {label} ({score}) @{tweet['username']} {tweet['id']}")
+        print(f"    -> ALERT SENT")
         time.sleep(1)  # be gentle with Telegram's rate limits
 
     return newest_id
