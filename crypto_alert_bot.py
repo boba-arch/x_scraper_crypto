@@ -70,7 +70,8 @@ INCIDENT_TERMS = [
 
 CRYPTO_CONTEXT_TERMS = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
-    "exchange", "dex",
+    "exchange", "dex", "protocol", "token", "bsc", "bnb", "polygon",
+    "arbitrum", "avalanche", "chain",
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
@@ -78,7 +79,7 @@ CRYPTO_CONTEXT_TERMS = [
 TRUSTED_ACCOUNTS = {
     "zachxbt", "peckshieldalert", "peckshield", "officer_cia",
     "certikalert", "certik", "slowmist_team", "cyversealerts",
-    "bitcoin_infoBTC", "whale_alert",
+    "bitcoin_infoBTC", "whale_alert","exvulsec",
 }
 
 # Words that indicate the incident is resolved/false-positive/hypothetical —
