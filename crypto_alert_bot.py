@@ -113,7 +113,7 @@ def build_query() -> str:
     # X API access tier than pay-per-use includes, so engagement filtering
     # happens client-side after fetch instead (see MIN_ENGAGEMENT_FILTER
     # in run_once) — it reduces alert noise, not the billed read count.
-    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet lang:en"
+    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet"
 
 
 def search_recent_tweets(since_id: str | None):
