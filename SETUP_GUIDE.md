@@ -96,6 +96,23 @@ doesn't share a rate limit with anyone else.
    step, the bot still works — it falls back to the free public endpoints,
    just less reliably.
 
+## Step 2c — Get an Anthropic API key for AI-based scoring (optional, recommended)
+
+Keyword matching can't tell "wallet drained in a DeFi exploit" from
+"growth hack for our new token" — an AI reading the actual tweet can.
+Adding this lets the bot judge each tweet's real content instead of just
+matching words.
+
+1. Go to https://console.anthropic.com and sign up / log in.
+2. Create an API key under **Settings → API Keys**.
+3. Add billing (usage-based, no monthly minimum). Classification with the
+   Haiku model costs a small fraction of a cent per tweet — expect low,
+   single-digit dollars per month at normal volume, but check your
+   console's usage page for exact current numbers.
+4. You'll add this as `ANTHROPIC_API_KEY` in Step 4. If you skip this
+   step, the bot still works — it falls back to the original keyword
+   scoring automatically.
+
 ## Step 3 — Put this project on GitHub
 
 1. Create a free account at https://github.com if needed.
@@ -118,6 +135,9 @@ doesn't share a rate limit with anyone else.
    - `TELEGRAM_CHAT_ID` → your chat ID from Step 2
    - `DEEPL_API_KEY` → your key from Step 2b (recommended, but the bot
      still runs without it)
+   - `ANTHROPIC_API_KEY` → your key from Step 2c (recommended, enables
+     AI-based scoring instead of keyword matching; bot falls back to
+     keywords without it)
 5. Railway will deploy and start running the bot automatically. Check the
    **Deployments → Logs** tab — you should see:
    `Crypto incident monitor starting up.`

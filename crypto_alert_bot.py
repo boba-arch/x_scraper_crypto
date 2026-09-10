@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import html
+import json
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -28,18 +29,20 @@ X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recommended
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # optional — enables AI scoring
+AI_MODEL = os.environ.get("AI_MODEL", "claude-haiku-4-5-20251001")
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "90"))
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "45"))
 
 # On first startup only (no since_id yet), how far back to look so we don't
 # miss anything but also don't backfill hours of history.
-INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "1"))
+INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "5"))
 
-# Minimum likes required for a tweet to even be returned by X's search —
-# filtering happens on X's side, before you're billed for the read, so
-# this is your main cost lever against noisy generic terms like "hack".
+# Minimum likes a tweet needs to trigger an alert. Applied client-side
+# after fetching — X's pay-per-use tier doesn't support engagement-based
+# query operators (min_faves), so this reduces alert noise, not read cost.
 MIN_ENGAGEMENT_FILTER = int(os.environ.get("MIN_ENGAGEMENT_FILTER", "5"))
 
 # Common false-positive phrases that share words with our incident terms
@@ -113,7 +116,7 @@ def build_query() -> str:
     # X API access tier than pay-per-use includes, so engagement filtering
     # happens client-side after fetch instead (see MIN_ENGAGEMENT_FILTER
     # in run_once) — it reduces alert noise, not the billed read count.
-    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet"
+    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet lang:en"
 
 
 def search_recent_tweets(since_id: str | None):
@@ -137,9 +140,13 @@ def search_recent_tweets(since_id: str | None):
         # not to how often we poll.
         params["since_id"] = since_id
     else:
-        # First run: just look back a few minutes so we don't backfill hours.
+        # First run: just look back a few minutes so we don't backfill
+        # hours. Enforce a floor well above X's "must be 10+ seconds in
+        # the past" requirement, as a safety margin against any clock
+        # skew between this container and X's servers.
+        lookback_seconds = max(INITIAL_LOOKBACK_MINUTES * 60, 60) + 30
         start_time = (
-            datetime.now(timezone.utc) - timedelta(minutes=INITIAL_LOOKBACK_MINUTES)
+            datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         params["start_time"] = start_time
 
@@ -170,6 +177,77 @@ def search_recent_tweets(since_id: str | None):
     # meta.newest_id tells us where to resume from next poll
     newest_id = data.get("meta", {}).get("newest_id", since_id)
     return results, newest_id
+
+
+def classify_with_ai(tweet_text: str):
+    """
+    Asks Claude to judge whether a tweet describes a real crypto security
+    incident and assign a risk score. Returns (score, label) or None if
+    AI scoring isn't configured or the call fails — callers should fall
+    back to the keyword-based score_risk() in that case.
+    """
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    system_prompt = (
+        "You are a crypto security risk analyst. Given a tweet, decide whether it "
+        "describes a REAL crypto security incident (exploit, hack, breach, funds "
+        "drained, private key compromise, rug pull, bridge exploit, etc.) as opposed "
+        "to unrelated content (memes, marketing, hackathons, general opinions, "
+        "giveaways, or vague/unconfirmed rumors with no real detail).\n\n"
+        "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
+        '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
+        '"reasoning": "<one short sentence>"}\n\n'
+        "Scoring guide: 0-24 = not a real incident, or a trivial/unconfirmed rumor. "
+        "25-44 = low-severity or early/unconfirmed report. 45-69 = confirmed "
+        "incident, moderate scale. 70-100 = confirmed major incident, large funds "
+        "lost or critical infrastructure compromised."
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": AI_MODEL,
+                "max_tokens": 150,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": tweet_text}],
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = "".join(
+            block.get("text", "") for block in data.get("content", [])
+            if block.get("type") == "text"
+        ).strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+
+        parsed = json.loads(text)
+        score = max(0, min(100, int(parsed.get("risk_score", 0))))
+        is_real = bool(parsed.get("is_real_incident", False))
+        if not is_real:
+            score = min(score, 15)  # force low if the AI says it's not real
+
+        if score >= 70:
+            label = "CRITICAL"
+        elif score >= 45:
+            label = "HIGH"
+        elif score >= 25:
+            label = "MEDIUM"
+        else:
+            label = "LOW"
+        return score, label
+
+    except Exception as e:
+        print(f"AI classification failed, falling back to keyword scoring: {e}",
+              file=sys.stderr)
+        return None
 
 
 def score_risk(tweet: dict) -> tuple[int, str]:
@@ -353,7 +431,13 @@ def run_once(since_id):
     for tweet in tweets:
         metrics = tweet.get("metrics", {})
         likes = metrics.get("like_count", 0)
-        score, label = score_risk(tweet)
+
+        ai_result = classify_with_ai(tweet["text"])
+        if ai_result:
+            score, label = ai_result
+        else:
+            score, label = score_risk(tweet)  # fallback: keyword heuristic
+
         preview = tweet["text"][:80].replace("\n", " ")
 
         # Always log the score, even for tweets that won't alert — this is
