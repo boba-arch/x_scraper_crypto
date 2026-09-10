@@ -64,7 +64,7 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 
 INCIDENT_TERMS = [
     "exploit", "hacked", "hack", "breach", "drained", "compromised",
-    "rugpull", "reentrancy", "private key leaked", "wallet drained",
+    "rugpull", "private key leaked", "wallet drained",
     "bridge exploit",
 ]
 
