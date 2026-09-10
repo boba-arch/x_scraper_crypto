@@ -182,9 +182,9 @@ def search_recent_tweets(since_id: str | None):
 def classify_with_ai(tweet_text: str):
     """
     Asks Claude to judge whether a tweet describes a real crypto security
-    incident and assign a risk score. Returns (score, label) or None if
-    AI scoring isn't configured or the call fails — callers should fall
-    back to the keyword-based score_risk() in that case.
+    incident and assign a risk score. Returns (score, label, reasoning) or
+    None if AI scoring isn't configured or the call fails — callers should
+    fall back to the keyword-based score_risk() in that case.
     """
     if not ANTHROPIC_API_KEY:
         return None
@@ -231,6 +231,7 @@ def classify_with_ai(tweet_text: str):
         parsed = json.loads(text)
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
         is_real = bool(parsed.get("is_real_incident", False))
+        reasoning = parsed.get("reasoning", "").strip()
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
 
@@ -242,7 +243,7 @@ def classify_with_ai(tweet_text: str):
             label = "MEDIUM"
         else:
             label = "LOW"
-        return score, label
+        return score, label, reasoning
 
     except Exception as e:
         print(f"AI classification failed, falling back to keyword scoring: {e}",
@@ -434,16 +435,21 @@ def run_once(since_id):
 
         ai_result = classify_with_ai(tweet["text"])
         if ai_result:
-            score, label = ai_result
+            score, label, reasoning = ai_result
+            source = "AI"
         else:
             score, label = score_risk(tweet)  # fallback: keyword heuristic
+            reasoning = ""
+            source = "keyword"
 
         preview = tweet["text"][:80].replace("\n", " ")
 
         # Always log the score, even for tweets that won't alert — this is
         # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
         # MIN_ENGAGEMENT_FILTER against real traffic.
-        print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
+        print(f"  [{label} {score}/100 via {source}] {likes} likes @{tweet['username']}: {preview}")
+        if reasoning:
+            print(f"    reasoning: {reasoning}")
 
         if likes < MIN_ENGAGEMENT_FILTER:
             print(f"    -> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
