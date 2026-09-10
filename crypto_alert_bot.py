@@ -107,12 +107,13 @@ def build_query() -> str:
     exclusions = " ".join(
         f'-"{t}"' if " " in t else f"-{t}" for t in NOISE_EXCLUSIONS
     )
-    # (incident terms) AND (crypto context terms) AND min engagement,
-    # minus common false-positive phrases, English only, no retweets
-    return (
-        f"({incident_clause}) ({context_clause}) {exclusions} "
-        f"min_faves:{MIN_ENGAGEMENT_FILTER} -is:retweet lang:en"
-    )
+    # (incident terms) AND (crypto context terms), minus common
+    # false-positive phrases, English only, no retweets.
+    # Note: min_faves / engagement-based query operators require a higher
+    # X API access tier than pay-per-use includes, so engagement filtering
+    # happens client-side after fetch instead (see MIN_ENGAGEMENT_FILTER
+    # in run_once) — it reduces alert noise, not the billed read count.
+    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet lang:en"
 
 
 def search_recent_tweets(since_id: str | None):
@@ -350,6 +351,11 @@ def run_once(since_id):
         print(f"[{datetime.now(timezone.utc).isoformat()}] {len(tweets)} new candidate tweet(s).")
 
     for tweet in tweets:
+        metrics = tweet.get("metrics", {})
+        likes = metrics.get("like_count", 0)
+        if likes < MIN_ENGAGEMENT_FILTER:
+            continue  # below engagement floor — skip, reduces alert noise
+
         score, label = score_risk(tweet)
         if score < MIN_RISK_SCORE_TO_ALERT:
             continue

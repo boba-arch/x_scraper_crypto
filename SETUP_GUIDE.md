@@ -17,10 +17,19 @@ Because this bot only reads *new* tweets (not the same batch repeatedly),
 your cost tracks actual incident volume, not how often it polls — **but
 that volume depends heavily on how broad your keyword query is.** Generic
 words like "hack" or "token" alone match huge amounts of unrelated
-crypto-Twitter noise. The default query here adds `min_faves:5` (a
-minimum-engagement filter applied by X itself, before you're billed) plus
-exclusions for common false-positive phrases, specifically to keep this
-under control. If you widen the keyword lists later, watch your usage
+crypto-Twitter noise. The default query here uses a trimmed, high-signal
+keyword list plus exclusions for common false-positive phrases
+(hackathons, airdrops, giveaways) to keep matched volume down.
+
+One thing worth knowing: X's `min_faves` (minimum-likes) query operator,
+which would let X filter low-engagement noise *before* billing you for it,
+requires a higher API access tier than pay-per-use includes — using it
+returns an error, not a discount. So engagement filtering here happens
+client-side, after the tweet is already fetched and billed
+(`MIN_ENGAGEMENT_FILTER`, default 5 likes) — it reduces alert noise in
+Telegram, but not the underlying read cost. If costs run high, your real
+lever is narrowing the keyword lists themselves, not the engagement
+threshold. If you widen the keyword lists later, watch your usage
 dashboard for a few hours afterward to catch any cost spike early.
 
 **Hosting**: for a lightweight always-on bot like this, Railway is the
@@ -206,9 +215,10 @@ All of these are environment variables — edit them directly in Railway's
 or Render's dashboard (no code, no redeploy hassle):
 
 - `MIN_ENGAGEMENT_FILTER` (default 5) — minimum likes a tweet needs to
-  even be returned by X's search. This is your **primary cost control** —
-  raise it (e.g. to 20 or 50) to cut billed volume sharply if costs run
-  high; lower it if you're missing low-engagement but real early signals.
+  trigger an alert. Applied *after* fetching (X's pricing tier doesn't
+  support filtering this before billing), so it reduces alert noise, not
+  cost. Raise it (e.g. to 20+) if you want fewer, higher-confidence
+  alerts.
 - `MIN_RISK_SCORE_TO_ALERT` (default 25) — raise to e.g. 45 to only get
   High/Critical alerts; lower to catch more.
 - `POLL_INTERVAL_SECONDS` (default 45) — how often it checks. Going lower
