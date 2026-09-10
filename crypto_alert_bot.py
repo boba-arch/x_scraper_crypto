@@ -27,37 +27,47 @@ from datetime import datetime, timedelta, timezone
 X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recommended
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "90"))
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "45"))
 
 # On first startup only (no since_id yet), how far back to look so we don't
 # miss anything but also don't backfill hours of history.
-INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "3"))
+INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "5"))
+
+# Minimum likes required for a tweet to even be returned by X's search —
+# filtering happens on X's side, before you're billed for the read, so
+# this is your main cost lever against noisy generic terms like "hack".
+MIN_ENGAGEMENT_FILTER = int(os.environ.get("MIN_ENGAGEMENT_FILTER", "5"))
+
+# Common false-positive phrases that share words with our incident terms
+# but are almost never real crypto security incidents (growth hacking,
+# hackathons, unrelated giveaway/airdrop spam). Excluded directly in the
+# X query to cut billed noise.
+NOISE_EXCLUSIONS = ["hackathon", "giveaway", "airdrop"]
 
 # Hard cap on how many tweets we pull per poll — mainly a safety ceiling for
 # traffic bursts, since since_id tracking already prevents re-reads.
-MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "25"))
+MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "10"))
 
 # Only alert if the computed risk score is at least this high (0-100).
-MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "50"))
+MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 
 # ---------------------------------------------------------------------------
 # Keyword / query strategy
 # ---------------------------------------------------------------------------
 
 INCIDENT_TERMS = [
-    "exploit", "exploited", "hacked", "hack", "incident", "breach",
-    "drained", "compromised", "rug pull", "rugpull", "reentrancy",
-    "flash loan attack", "flashloan attack", "oracle manipulation",
-    "private key leaked", "seed phrase", "wallet drained",
-    "bridge exploit", "smart contract vulnerability", "unauthorized withdrawal",
+    "exploit", "hacked", "hack", "breach", "drained", "compromised",
+    "rugpull", "reentrancy", "private key leaked", "wallet drained",
+    "bridge exploit",
 ]
 
 CRYPTO_CONTEXT_TERMS = [
-    "crypto", "bitcoin", "ethereum", "solana", "defi", "blockchain",
-    "web3", "token", "protocol", "bridge", "exchange", "cex", "dex",
+    "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
+    "exchange", "dex",
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
@@ -65,7 +75,7 @@ CRYPTO_CONTEXT_TERMS = [
 TRUSTED_ACCOUNTS = {
     "zachxbt", "peckshieldalert", "peckshield", "officer_cia",
     "certikalert", "certik", "slowmist_team", "cyversealerts",
-    "bitcoin_infoBTC", "whale_alert","SlowMist_Team","blockaid_",
+    "bitcoin_infoBTC", "whale_alert",
 }
 
 # Words that indicate the incident is resolved/false-positive/hypothetical —
@@ -94,8 +104,15 @@ LOW_SEVERITY = [
 def build_query() -> str:
     incident_clause = " OR ".join(f'"{t}"' if " " in t else t for t in INCIDENT_TERMS)
     context_clause = " OR ".join(CRYPTO_CONTEXT_TERMS)
-    # (incident terms) AND (crypto context terms), English, no retweets
-    return f"({incident_clause}) ({context_clause}) -is:retweet lang:en"
+    exclusions = " ".join(
+        f'-"{t}"' if " " in t else f"-{t}" for t in NOISE_EXCLUSIONS
+    )
+    # (incident terms) AND (crypto context terms) AND min engagement,
+    # minus common false-positive phrases, English only, no retweets
+    return (
+        f"({incident_clause}) ({context_clause}) {exclusions} "
+        f"min_faves:{MIN_ENGAGEMENT_FILTER} -is:retweet lang:en"
+    )
 
 
 def search_recent_tweets(since_id: str | None):
@@ -196,13 +213,34 @@ def score_risk(tweet: dict) -> tuple[int, str]:
 
 def translate_to_chinese(text: str) -> str:
     """
-    Translates to Simplified Chinese using a free, keyless endpoint, with a
-    second free provider as fallback if the first fails. Both are
-    best-effort public services (not paid, no SLA) — for guaranteed
-    reliability at scale, swap this for a paid translation API.
+    Translates to Simplified Chinese. Tries DeepL first (reliable, your own
+    quota, needs DEEPL_API_KEY) then falls back to two free keyless
+    endpoints if DeepL isn't configured or has an outage.
     """
-    # Primary: Google Translate's public endpoint, with a browser-like
-    # User-Agent — some hosts get silently rejected without one.
+    # Primary: DeepL, if a key is configured. Reliable, authenticated,
+    # 500,000 free characters/month — no shared-IP throttling like the
+    # free public endpoints below.
+    if DEEPL_API_KEY:
+        try:
+            resp = requests.post(
+                "https://api-free.deepl.com/v2/translate",
+                headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+                data={"text": text, "target_lang": "ZH"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            translated = resp.json()["translations"][0]["text"]
+            if translated.strip():
+                return translated
+        except Exception as e:
+            print(f"Primary translation (DeepL) failed: {e}", file=sys.stderr)
+    else:
+        print("DEEPL_API_KEY not set — using free fallback translators "
+              "(less reliable). See SETUP_GUIDE.md to add DeepL.", file=sys.stderr)
+
+    # Fallback 1: Google Translate's public endpoint, with a browser-like
+    # User-Agent — some hosts get silently rejected without one. Prone to
+    # rate limiting (429) from shared cloud-host IPs.
     try:
         resp = requests.get(
             "https://translate.googleapis.com/translate_a/single",
@@ -226,9 +264,9 @@ def translate_to_chinese(text: str) -> str:
         if translated.strip():
             return translated
     except Exception as e:
-        print(f"Primary translation (Google) failed: {e}", file=sys.stderr)
+        print(f"Fallback translation (Google) failed: {e}", file=sys.stderr)
 
-    # Fallback: MyMemory's free translation API (no key required, rate
+    # Fallback 2: MyMemory's free translation API (no key required, rate
     # limited but fine for occasional fallback use).
     try:
         resp = requests.get(
@@ -326,7 +364,9 @@ def run_once(since_id):
 
 def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] Crypto incident monitor starting up.")
-    print(f"Polling every {POLL_INTERVAL_SECONDS}s. Alert threshold: {MIN_RISK_SCORE_TO_ALERT}.")
+    print(f"Polling every {POLL_INTERVAL_SECONDS}s. Alert threshold: {MIN_RISK_SCORE_TO_ALERT}. "
+          f"Min engagement filter: {MIN_ENGAGEMENT_FILTER} likes.")
+    print(f"Search query: {build_query()}")
 
     if not X_BEARER_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("ERROR: Missing one or more required env vars: X_BEARER_TOKEN, "

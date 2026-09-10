@@ -14,10 +14,14 @@ instant, but close, and dramatically cheaper.
 
 X moved to pay-per-use pricing in Feb 2026: reading a tweet costs $0.005.
 Because this bot only reads *new* tweets (not the same batch repeatedly),
-your cost tracks actual incident volume, not how often it polls. A rough
-estimate: even a noisy day with 200 matching tweets globally costs $1.
-Realistically this will be a few dollars a month on the X side — the
-bigger cost is hosting.
+your cost tracks actual incident volume, not how often it polls — **but
+that volume depends heavily on how broad your keyword query is.** Generic
+words like "hack" or "token" alone match huge amounts of unrelated
+crypto-Twitter noise. The default query here adds `min_faves:5` (a
+minimum-engagement filter applied by X itself, before you're billed) plus
+exclusions for common false-positive phrases, specifically to keep this
+under control. If you widen the keyword lists later, watch your usage
+dashboard for a few hours afterward to catch any cost spike early.
 
 **Hosting**: for a lightweight always-on bot like this, Railway is the
 simplest option — connect your GitHub repo, it deploys automatically as a
@@ -67,6 +71,22 @@ priorities shift.
    - Find `"chat":{"id": ...}` in the response — that number (possibly
      negative, for groups) is your chat ID.
 
+## Step 2b — Get a free DeepL translation key (recommended)
+
+The free public translate endpoints get rate-limited when called from
+shared cloud IPs like Railway's — you may see "(translation unavailable)"
+in alerts as a result. A free DeepL API key fixes this: 500,000
+characters/month at no cost, authenticated to your own account so it
+doesn't share a rate limit with anyone else.
+
+1. Go to https://www.deepl.com/pro-api and sign up for **DeepL API Free**
+   (a card is required to verify identity, but you won't be charged unless
+   you explicitly upgrade).
+2. Once signed up, find your **Authentication Key** under Account settings.
+3. You'll add this as `DEEPL_API_KEY` in Step 4 below. If you skip this
+   step, the bot still works — it falls back to the free public endpoints,
+   just less reliably.
+
 ## Step 3 — Put this project on GitHub
 
 1. Create a free account at https://github.com if needed.
@@ -87,6 +107,8 @@ priorities shift.
    - `X_BEARER_TOKEN` → your token from Step 1
    - `TELEGRAM_BOT_TOKEN` → your token from Step 2
    - `TELEGRAM_CHAT_ID` → your chat ID from Step 2
+   - `DEEPL_API_KEY` → your key from Step 2b (recommended, but the bot
+     still runs without it)
 5. Railway will deploy and start running the bot automatically. Check the
    **Deployments → Logs** tab — you should see:
    `Crypto incident monitor starting up.`
@@ -183,6 +205,10 @@ Two ways to do this without waiting indefinitely:
 All of these are environment variables — edit them directly in Railway's
 or Render's dashboard (no code, no redeploy hassle):
 
+- `MIN_ENGAGEMENT_FILTER` (default 5) — minimum likes a tweet needs to
+  even be returned by X's search. This is your **primary cost control** —
+  raise it (e.g. to 20 or 50) to cut billed volume sharply if costs run
+  high; lower it if you're missing low-engagement but real early signals.
 - `MIN_RISK_SCORE_TO_ALERT` (default 25) — raise to e.g. 45 to only get
   High/Critical alerts; lower to catch more.
 - `POLL_INTERVAL_SECONDS` (default 45) — how often it checks. Going lower
@@ -199,13 +225,12 @@ add specific chains/protocols you care about.
 
 ## Important caveats
 
-- **Translation**: uses two free, keyless services as a primary/fallback
-  pair (Google Translate's public endpoint, then MyMemory if that fails) —
-  good for a quick read, not guaranteed to stay up or be perfectly
-  accurate. Verify against the English original before citing in a report.
-  If you ever see "(translation unavailable — see logs)" in an alert,
-  check the Railway/Render logs — they'll print the actual underlying
-  error from both providers, which tells you exactly what broke.
+- **Translation**: uses DeepL if you've added `DEEPL_API_KEY` (reliable,
+  your own quota, 500K free chars/month) with two free keyless services
+  (Google, then MyMemory) as fallback if DeepL isn't configured or has a
+  brief outage. If you ever see "(translation unavailable — see logs)" in
+  an alert, check the Railway/Render logs — they print the actual
+  underlying error from each provider in the order they were tried.
 - **Risk score is a triage heuristic, not a verified assessment.** Built
   from keyword severity, trusted-account matching, and engagement —
   useful for prioritization, not a substitute for your own verification
