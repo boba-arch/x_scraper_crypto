@@ -31,11 +31,11 @@ DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recomme
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "45"))
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "90"))
 
 # On first startup only (no since_id yet), how far back to look so we don't
 # miss anything but also don't backfill hours of history.
-INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "5"))
+INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "0"))
 
 # Minimum likes required for a tweet to even be returned by X's search —
 # filtering happens on X's side, before you're billed for the read, so
