@@ -13,24 +13,26 @@ instant, but close, and dramatically cheaper.
 ## Cost reality check
 
 X moved to pay-per-use pricing in Feb 2026: reading a tweet costs $0.005.
-Because this bot only reads *new* tweets (not the same batch repeatedly),
-your cost tracks actual incident volume, not how often it polls — **but
-that volume depends heavily on how broad your keyword query is.** Generic
-words like "hack" or "token" alone match huge amounts of unrelated
-crypto-Twitter noise. The default query here uses a trimmed, high-signal
-keyword list plus exclusions for common false-positive phrases
-(hackathons, airdrops, giveaways) to keep matched volume down.
+This bot searches **only tweets from your `TRUSTED_ACCOUNTS` list**
+(ZachXBT, PeckShield, SlowMist, CertiK, etc.) — no keyword filtering on
+top of that. That might sound like it'd cost more (every tweet these
+accounts post gets fetched, not just ones matching specific words), but
+in practice it's far cheaper *and* more accurate than a platform-wide
+keyword search: your cost ceiling is bounded by how often ~11 accounts
+actually tweet (typically a handful of relevant posts per day, combined),
+not by how many people on all of X happen to use a word like "hack."
 
-One thing worth knowing: X's `min_faves` (minimum-likes) query operator,
-which would let X filter low-engagement noise *before* billing you for it,
-requires a higher API access tier than pay-per-use includes — using it
-returns an error, not a discount. So engagement filtering here happens
-client-side, after the tweet is already fetched and billed
-(`MIN_ENGAGEMENT_FILTER`, default 5 likes) — it reduces alert noise in
-Telegram, but not the underlying read cost. If costs run high, your real
-lever is narrowing the keyword lists themselves, not the engagement
-threshold. If you widen the keyword lists later, watch your usage
-dashboard for a few hours afterward to catch any cost spike early.
+Keyword-based filtering was tried first and dropped — real security
+researchers describe incidents in constantly varying technical language
+("cache key collision," "minted with no peg-in," etc.) that any fixed
+word list will eventually miss. Instead, every tweet from a trusted
+account gets fetched and handed to the AI classifier to judge — a much
+better filter than string matching, at a small added AI cost per tweet
+(see the Anthropic section above).
+
+If you widen `TRUSTED_ACCOUNTS` later, watch your usage dashboard for a
+few hours afterward, same as always — a very high-volume account added to
+the list could meaningfully raise cost.
 
 **Hosting**: for a lightweight always-on bot like this, Railway is the
 simplest option — connect your GitHub repo, it deploys automatically as a
@@ -252,6 +254,30 @@ Render auto-redeploys) to tune which accounts get a risk-score boost, or
 add specific chains/protocols you care about.
 
 ---
+
+## Bot self-monitoring (health alerts)
+
+The bot now watches itself and pages you on Telegram — as a separate
+"🔧 BOT HEALTH ALERT" message, distinct from incident alerts — if it's
+failing to fetch tweets. It pages immediately for unambiguous causes
+(X credits depleted, bad/expired token), or after 3 failed polls in a row
+for anything else, and won't re-page more than once per 30 minutes while
+the problem persists. It also tells you when it recovers.
+
+**What this can't cover**: if the entire Railway process crashes or
+freezes (rather than a single poll failing), the code obviously can't run
+to send its own alert — a dead process can't page you about being dead.
+For that gap, set up Railway's own notifications as a second layer:
+
+1. In Railway, go to your project's **Settings → Integrations** (or
+   similar, naming varies) and connect a notification channel — Discord,
+   Slack, or email webhooks are typically supported.
+2. Enable alerts for deployment failures / crashes.
+
+This gives you two independent layers: the bot pages you about *its own*
+partial failures (API errors), and Railway pages you if the *whole
+process* goes down. Worth having both, since each only sees what's
+inside its own boundary.
 
 ## Important caveats
 
