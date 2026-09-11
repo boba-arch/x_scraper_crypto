@@ -109,15 +109,16 @@ LOW_SEVERITY = [
 
 
 def build_query() -> str:
-    # Source-restricted AND keyword-filtered: only tweets FROM known
-    # reputable crypto security reporters (TRUSTED_ACCOUNTS) that also
-    # mention one of INCIDENT_TERMS. Narrower and cheaper than the
-    # source-only version, at the cost of missing incidents these
-    # accounts describe without using one of these exact words (the AI
-    # classifier downstream still judges whatever does match).
-    from_clause = " OR ".join(f"from:{u}" for u in TRUSTED_ACCOUNTS)
     incident_clause = " OR ".join(f'"{t}"' if " " in t else t for t in INCIDENT_TERMS)
-    return f"({from_clause}) ({incident_clause}) -is:retweet"
+    context_clause = " OR ".join(CRYPTO_CONTEXT_TERMS)
+    exclusions = " ".join(
+        f'-"{t}"' if " " in t else f"-{t}" for t in NOISE_EXCLUSIONS
+    )
+    # Broad search across all of Twitter (not source-restricted) — trades
+    # lower cost for wider coverage. The AI classification step is what
+    # keeps this usable: it judges source credibility and current/active
+    # status per-tweet instead of relying on a pre-vetted account list.
+    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet -is:quote lang:en"
 
 
 def search_recent_tweets(since_id: str | None):
@@ -191,23 +192,38 @@ def search_recent_tweets(since_id: str | None):
     return results, newest_id, None
 
 
-def classify_with_ai(tweet_text: str):
+def classify_with_ai(tweet: dict):
     """
-    Asks Claude to judge whether a tweet describes a real crypto security
-    incident and assign a risk score. Returns (score, label, reasoning) or
-    None if AI scoring isn't configured or the call fails — callers should
-    fall back to the keyword-based score_risk() in that case.
+    Asks Claude to judge whether a tweet describes a real, currently-active
+    crypto security incident and assign a risk score. Returns
+    (score, label, summary, reasoning) or None if AI scoring isn't
+    configured or the call fails — callers should fall back to the
+    keyword-based score_risk() in that case.
     """
     if not ANTHROPIC_API_KEY:
         return None
+
+    username = tweet.get("username", "unknown")
+    is_known_trusted = username.lower() in TRUSTED_ACCOUNTS
+    trusted_list = ", ".join(sorted(TRUSTED_ACCOUNTS))
 
     system_prompt = (
         "You are a crypto security journalist and threat-intel analyst, in "
         "the same vein as Blockaid or SlowMist's team — your job is to track "
         "ACTIVE, ONGOING, or JUST-BROKE crypto security incidents in real "
-        "time for a risk officer at an exchange, not to catalog history. "
-        "You'll be given a tweet from a reputable security researcher/firm "
-        "(already vetted — assume the source itself is credible).\n\n"
+        "time for a risk officer at an exchange, not to catalog history.\n\n"
+        "This search is NOT restricted to pre-vetted accounts — you will "
+        "see tweets from anyone, including random or unverified accounts "
+        "making claims. Judge source credibility yourself: known reputable "
+        f"security researchers/firms include: {trusted_list}. A tweet from "
+        "one of these can be treated as credible on its own. A tweet from "
+        "an unknown/unverified account needs concrete supporting detail "
+        "(specific contract address, tx hash, dollar amount, on-chain "
+        "evidence) to be treated as credible — vague claims with no "
+        "specifics from an unknown source should score low even if "
+        "alarming-sounding.\n\n"
+        "You'll be told the tweet's author username. Weigh that alongside "
+        "the tweet's own content.\n\n"
         "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
         '"summary": "<Start with a line in EXACTLY this format: '
@@ -215,24 +231,30 @@ def classify_with_ai(tweet_text: str):
         "Then, on a new line, 2-3 plain-English sentences explaining what "
         "happened, in clear non-technical language a risk officer can act "
         'on — what was exploited, how, and the scale of loss if known>", '
-        '"reasoning": "<one short sentence on why this score>"}\n\n'
+        '"reasoning": "<one short sentence on why this score, including '
+        'your source-credibility judgment>"}\n\n'
         "Set is_real_incident to FALSE if this is NOT a fresh or currently "
         "unfolding incident — this includes general commentary, educational "
         "threads about attack techniques in the abstract, retrospectives or "
         "anniversaries of old hacks (e.g. '2 years ago today...', 'revisiting "
         "the X hack'), or a rehash of previously reported news with no new "
-        "development. Set it TRUE for incidents that are newly disclosed, "
-        "actively unfolding (funds still moving, investigation ongoing), or "
-        "a meaningful update to a very recent incident (new loss figures, "
-        "attacker identified, funds frozen/recovered).\n\n"
-        "Scoring guide — weight recency and active status heavily: "
-        "0-24 = not current (old news, retrospective, educational) or "
-        "minor/unconfirmed. 25-44 = confirmed, small-scale, or recent but "
-        "low-impact. 45-69 = confirmed, moderate scale, and actively "
-        "unfolding or very recent. 70-100 = confirmed MAJOR incident that "
-        "is currently active or just happened — large funds lost, attacker "
-        "still moving funds, or critical infrastructure compromised."
+        "development. Also set it FALSE if the claim is unsubstantiated and "
+        "from an unverified source. Set it TRUE for incidents that are "
+        "newly disclosed, actively unfolding (funds still moving, "
+        "investigation ongoing), or a meaningful update to a very recent "
+        "incident (new loss figures, attacker identified, funds frozen).\n\n"
+        "Scoring guide — weight recency, active status, AND source "
+        "credibility heavily: 0-24 = not current, unsubstantiated, or from "
+        "an unverified source with no supporting detail. 25-44 = confirmed, "
+        "small-scale, or recent but low-impact. 45-69 = confirmed, "
+        "moderate scale, actively unfolding or very recent, credible "
+        "source. 70-100 = confirmed MAJOR incident that is currently "
+        "active or just happened, from a credible source or with strong "
+        "supporting evidence — large funds lost, attacker still moving "
+        "funds, or critical infrastructure compromised."
     )
+
+    user_message = f"Tweet author: @{username}\nTweet text: {tweet['text']}"
 
     try:
         resp = requests.post(
@@ -246,7 +268,7 @@ def classify_with_ai(tweet_text: str):
                 "model": AI_MODEL,
                 "max_tokens": 150,
                 "system": system_prompt,
-                "messages": [{"role": "user", "content": tweet_text}],
+                "messages": [{"role": "user", "content": user_message}],
             },
             timeout=20,
         )
@@ -483,7 +505,7 @@ def run_once(since_id):
         metrics = tweet.get("metrics", {})
         likes = metrics.get("like_count", 0)
 
-        ai_result = classify_with_ai(tweet["text"])
+        ai_result = classify_with_ai(tweet)
         if ai_result:
             score, label, summary, reasoning = ai_result
             source = "AI"
