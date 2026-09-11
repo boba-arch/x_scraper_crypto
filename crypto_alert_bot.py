@@ -62,9 +62,6 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 # Keyword / query strategy
 # ---------------------------------------------------------------------------
 
-# NOTE: currently unused — build_query() no longer filters by keyword
-# (see comment there for why). Left here in case you want to reintroduce
-# a keyword filter later, or reference these words elsewhere.
 INCIDENT_TERMS = [
     "exploit", "hacked", "breach", "drained", "compromised",
     "rugpull", "reentrancy", "private key leaked", "wallet drained",
@@ -112,16 +109,15 @@ LOW_SEVERITY = [
 
 
 def build_query() -> str:
-    # Source-restricted only — no keyword requirement. Trusted security
-    # researchers describe incidents in wildly varying technical language
-    # ("cache key collision", "minted with no peg-in", etc.) that a fixed
-    # keyword list will always eventually miss. Since these accounts are
-    # already curated for relevance, every tweet they post gets fetched
-    # and handed to the AI classifier downstream to judge — that's a far
-    # better filter than string matching, and volume stays low since it's
-    # bounded by how often ~11 accounts actually tweet, not by keywords.
+    # Source-restricted AND keyword-filtered: only tweets FROM known
+    # reputable crypto security reporters (TRUSTED_ACCOUNTS) that also
+    # mention one of INCIDENT_TERMS. Narrower and cheaper than the
+    # source-only version, at the cost of missing incidents these
+    # accounts describe without using one of these exact words (the AI
+    # classifier downstream still judges whatever does match).
     from_clause = " OR ".join(f"from:{u}" for u in TRUSTED_ACCOUNTS)
-    return f"({from_clause}) -is:retweet"
+    incident_clause = " OR ".join(f'"{t}"' if " " in t else t for t in INCIDENT_TERMS)
+    return f"({from_clause}) ({incident_clause}) -is:retweet"
 
 
 def search_recent_tweets(since_id: str | None):
@@ -214,9 +210,11 @@ def classify_with_ai(tweet_text: str):
         "(already vetted — assume the source itself is credible).\n\n"
         "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
-        '"summary": "<2-3 plain-English sentences explaining what happened, '
-        "in clear non-technical language a risk officer can act on — what "
-        "was exploited, how, and the scale of loss if known>\", "
+        '"summary": "<Start with a line in EXACTLY this format: '
+        "'Affected project/tokens: <name(s), or \\'Unknown\\' if not stated>'. "
+        "Then, on a new line, 2-3 plain-English sentences explaining what "
+        "happened, in clear non-technical language a risk officer can act "
+        'on — what was exploited, how, and the scale of loss if known>", '
         '"reasoning": "<one short sentence on why this score>"}\n\n'
         "Set is_real_incident to FALSE if this is NOT a fresh or currently "
         "unfolding incident — this includes general commentary, educational "
