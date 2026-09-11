@@ -190,7 +190,7 @@ def classify_with_ai(tweet_text: str):
     if not ANTHROPIC_API_KEY:
         return None
 
-        system_prompt = (
+    system_prompt = (
         "You are a crypto security journalist and analyst, in the same vein as "
         "Blockaid or the SlowMist security team — your job is real-time incident "
         "reporting for a risk officer at a crypto exchange who needs to know what "
