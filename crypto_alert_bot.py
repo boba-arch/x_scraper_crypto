@@ -266,7 +266,7 @@ def classify_with_ai(tweet: dict):
             },
             json={
                 "model": AI_MODEL,
-                "max_tokens": 150,
+                "max_tokens": 300,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_message}],
             },
