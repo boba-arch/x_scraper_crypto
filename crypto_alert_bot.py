@@ -190,21 +190,37 @@ def classify_with_ai(tweet_text: str):
     if not ANTHROPIC_API_KEY:
         return None
 
-    system_prompt = (
-        "You are a crypto security risk analyst. Given a tweet, decide whether it "
-        "describes a REAL crypto security incident (exploit, hack, breach, funds "
-        "drained, private key compromise, rug pull, bridge exploit, etc.) as opposed "
-        "to unrelated content (memes, marketing, hackathons, general opinions, "
-        "giveaways, or vague/unconfirmed rumors with no real detail).\n\n"
+        system_prompt = (
+        "You are a crypto security journalist and analyst, in the same vein as "
+        "Blockaid or the SlowMist security team — your job is real-time incident "
+        "reporting for a risk officer at a crypto exchange who needs to know what "
+        "is happening RIGHT NOW, not a history lesson. You'll be given a tweet "
+        "from a reputable security researcher/firm (already vetted — assume the "
+        "source itself is credible).\n\n"
+        "Pay close attention to whether this describes an incident that is "
+        "actively unfolding or was just discovered/confirmed, versus a "
+        "retrospective look-back, anniversary post, historical recap, or general "
+        "education referencing a past incident. Score higher for live, breaking, "
+        "or very recent reports; score lower for retrospectives or old incidents "
+        "being revisited, even if the underlying incident itself was severe.\n\n"
         "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
-        '"reasoning": "<one short sentence>"}\n\n'
-        "Scoring guide: 0-24 = not a real incident, or a trivial/unconfirmed rumor. "
-        "25-44 = low-severity or early/unconfirmed report. 45-69 = confirmed "
-        "incident, moderate scale. 70-100 = confirmed major incident, large funds "
-        "lost or critical infrastructure compromised."
+        '"summary": "<2-3 plain-English sentences explaining what happened, '
+        "in clear non-technical language a risk officer can act on — what "
+        "was exploited, how, and the scale of loss if known>\", "
+        '"reasoning": "<one short sentence on why this score, explicitly noting '
+        'if this is breaking/current or a retrospective/historical report>"}\n\n'
+        "Set is_real_incident to false only if this tweet is NOT actually "
+        "reporting a security incident (e.g. it's a general commentary, pure "
+        "educational content with no specific incident, or an unrelated post).\n\n"
+        "Scoring guide: 0-24 = minor/unconfirmed impact, or a retrospective/"
+        "historical/anniversary post about an old incident. 25-44 = confirmed "
+        "but small-scale, or an already-resolved incident from days/weeks ago. "
+        "45-69 = confirmed, moderate scale or a notable protocol/chain, actively "
+        "unfolding or discovered within the last 24-48 hours. 70-100 = confirmed "
+        "major incident actively unfolding right now or just discovered, large "
+        "funds lost or critical infrastructure compromised."
     )
-
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
