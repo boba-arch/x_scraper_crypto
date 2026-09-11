@@ -62,16 +62,22 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 # Keyword / query strategy
 # ---------------------------------------------------------------------------
 
+# NOTE: currently unused — build_query() no longer filters by keyword
+# (see comment there for why). Left here in case you want to reintroduce
+# a keyword filter later, or reference these words elsewhere.
 INCIDENT_TERMS = [
-    "exploit", "hacked", "hack", "breach", "drained", "compromised",
-    "rugpull", "private key leaked", "wallet drained",
+    "exploit", "hacked", "breach", "drained", "compromised",
+    "rugpull", "reentrancy", "private key leaked", "wallet drained",
     "bridge exploit",
 ]
 
+# NOTE: currently unused — build_query() now restricts search to
+# TRUSTED_ACCOUNTS only (from:...), which is far cheaper than matching
+# these context words across all of Twitter. Left here in case you ever
+# want to revert to a broader, non-source-restricted search.
 CRYPTO_CONTEXT_TERMS = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
-    "exchange", "dex", "protocol", "token", "bsc", "bnb", "polygon",
-    "arbitrum", "avalanche", "chain",
+    "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
@@ -79,7 +85,7 @@ CRYPTO_CONTEXT_TERMS = [
 TRUSTED_ACCOUNTS = {
     "zachxbt", "peckshieldalert", "peckshield", "officer_cia",
     "certikalert", "certik", "slowmist_team", "cyversealerts",
-    "bitcoin_infoBTC", "whale_alert","exvulsec",
+    "bitcoin_infoBTC", "whale_alert", "exvulsec",
 }
 
 # Words that indicate the incident is resolved/false-positive/hypothetical —
@@ -106,21 +112,25 @@ LOW_SEVERITY = [
 
 
 def build_query() -> str:
-    incident_clause = " OR ".join(f'"{t}"' if " " in t else t for t in INCIDENT_TERMS)
-    context_clause = " OR ".join(CRYPTO_CONTEXT_TERMS)
-    exclusions = " ".join(
-        f'-"{t}"' if " " in t else f"-{t}" for t in NOISE_EXCLUSIONS
-    )
-    # (incident terms) AND (crypto context terms), minus common
-    # false-positive phrases, English only, no retweets.
-    # Note: min_faves / engagement-based query operators require a higher
-    # X API access tier than pay-per-use includes, so engagement filtering
-    # happens client-side after fetch instead (see MIN_ENGAGEMENT_FILTER
-    # in run_once) — it reduces alert noise, not the billed read count.
-    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet lang:en"
+    # Source-restricted only — no keyword requirement. Trusted security
+    # researchers describe incidents in wildly varying technical language
+    # ("cache key collision", "minted with no peg-in", etc.) that a fixed
+    # keyword list will always eventually miss. Since these accounts are
+    # already curated for relevance, every tweet they post gets fetched
+    # and handed to the AI classifier downstream to judge — that's a far
+    # better filter than string matching, and volume stays low since it's
+    # bounded by how often ~11 accounts actually tweet, not by keywords.
+    from_clause = " OR ".join(f"from:{u}" for u in TRUSTED_ACCOUNTS)
+    return f"({from_clause}) -is:retweet"
 
 
 def search_recent_tweets(since_id: str | None):
+    """
+    Returns (tweets, newest_id, error_message). error_message is None on
+    success (even if zero tweets matched — that's a normal quiet period,
+    not a failure). It's set to a short description on any API error, so
+    the caller can distinguish "nothing happened" from "something broke".
+    """
     if not X_BEARER_TOKEN:
         print("ERROR: X_BEARER_TOKEN is not set.", file=sys.stderr)
         sys.exit(1)
@@ -152,12 +162,17 @@ def search_recent_tweets(since_id: str | None):
         params["start_time"] = start_time
 
     resp = requests.get(url, headers=headers, params=params, timeout=30)
+
+    if resp.status_code == 402:
+        return [], since_id, "X API credits depleted (402) — no credit left to fetch tweets."
+    if resp.status_code == 401:
+        return [], since_id, "X API authentication failed (401) — bearer token may be invalid/expired."
     if resp.status_code == 429:
         print("Rate limited by X API, will back off and retry next poll.", file=sys.stderr)
-        return [], since_id
+        return [], since_id, None  # transient, not worth paging over on its own
     if resp.status_code != 200:
         print(f"X API error {resp.status_code}: {resp.text}", file=sys.stderr)
-        return [], since_id
+        return [], since_id, f"X API error {resp.status_code}: {resp.text[:200]}"
 
     data = resp.json()
     tweets = data.get("data", [])
@@ -177,7 +192,7 @@ def search_recent_tweets(since_id: str | None):
 
     # meta.newest_id tells us where to resume from next poll
     newest_id = data.get("meta", {}).get("newest_id", since_id)
-    return results, newest_id
+    return results, newest_id, None
 
 
 def classify_with_ai(tweet_text: str):
@@ -191,36 +206,36 @@ def classify_with_ai(tweet_text: str):
         return None
 
     system_prompt = (
-        "You are a crypto security journalist and analyst, in the same vein as "
-        "Blockaid or the SlowMist security team — your job is real-time incident "
-        "reporting for a risk officer at a crypto exchange who needs to know what "
-        "is happening RIGHT NOW, not a history lesson. You'll be given a tweet "
-        "from a reputable security researcher/firm (already vetted — assume the "
-        "source itself is credible).\n\n"
-        "Pay close attention to whether this describes an incident that is "
-        "actively unfolding or was just discovered/confirmed, versus a "
-        "retrospective look-back, anniversary post, historical recap, or general "
-        "education referencing a past incident. Score higher for live, breaking, "
-        "or very recent reports; score lower for retrospectives or old incidents "
-        "being revisited, even if the underlying incident itself was severe.\n\n"
+        "You are a crypto security journalist and threat-intel analyst, in "
+        "the same vein as Blockaid or SlowMist's team — your job is to track "
+        "ACTIVE, ONGOING, or JUST-BROKE crypto security incidents in real "
+        "time for a risk officer at an exchange, not to catalog history. "
+        "You'll be given a tweet from a reputable security researcher/firm "
+        "(already vetted — assume the source itself is credible).\n\n"
         "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
         '"summary": "<2-3 plain-English sentences explaining what happened, '
         "in clear non-technical language a risk officer can act on — what "
         "was exploited, how, and the scale of loss if known>\", "
-        '"reasoning": "<one short sentence on why this score, explicitly noting '
-        'if this is breaking/current or a retrospective/historical report>"}\n\n'
-        "Set is_real_incident to false only if this tweet is NOT actually "
-        "reporting a security incident (e.g. it's a general commentary, pure "
-        "educational content with no specific incident, or an unrelated post).\n\n"
-        "Scoring guide: 0-24 = minor/unconfirmed impact, or a retrospective/"
-        "historical/anniversary post about an old incident. 25-44 = confirmed "
-        "but small-scale, or an already-resolved incident from days/weeks ago. "
-        "45-69 = confirmed, moderate scale or a notable protocol/chain, actively "
-        "unfolding or discovered within the last 24-48 hours. 70-100 = confirmed "
-        "major incident actively unfolding right now or just discovered, large "
-        "funds lost or critical infrastructure compromised."
+        '"reasoning": "<one short sentence on why this score>"}\n\n'
+        "Set is_real_incident to FALSE if this is NOT a fresh or currently "
+        "unfolding incident — this includes general commentary, educational "
+        "threads about attack techniques in the abstract, retrospectives or "
+        "anniversaries of old hacks (e.g. '2 years ago today...', 'revisiting "
+        "the X hack'), or a rehash of previously reported news with no new "
+        "development. Set it TRUE for incidents that are newly disclosed, "
+        "actively unfolding (funds still moving, investigation ongoing), or "
+        "a meaningful update to a very recent incident (new loss figures, "
+        "attacker identified, funds frozen/recovered).\n\n"
+        "Scoring guide — weight recency and active status heavily: "
+        "0-24 = not current (old news, retrospective, educational) or "
+        "minor/unconfirmed. 25-44 = confirmed, small-scale, or recent but "
+        "low-impact. 45-69 = confirmed, moderate scale, and actively "
+        "unfolding or very recent. 70-100 = confirmed MAJOR incident that "
+        "is currently active or just happened — large funds lost, attacker "
+        "still moving funds, or critical infrastructure compromised."
     )
+
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -248,6 +263,7 @@ def classify_with_ai(tweet_text: str):
         parsed = json.loads(text)
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
         is_real = bool(parsed.get("is_real_incident", False))
+        summary = parsed.get("summary", "").strip()
         reasoning = parsed.get("reasoning", "").strip()
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
@@ -260,7 +276,7 @@ def classify_with_ai(tweet_text: str):
             label = "MEDIUM"
         else:
             label = "LOW"
-        return score, label, reasoning
+        return score, label, summary, reasoning
 
     except Exception as e:
         print(f"AI classification failed, falling back to keyword scoring: {e}",
@@ -397,19 +413,28 @@ def send_telegram_alert(message: str):
         print(f"Telegram send failed: {resp.status_code} {resp.text}", file=sys.stderr)
 
 
-def format_alert(tweet: dict, score: int, label: str, zh_text: str) -> str:
+def format_alert(tweet: dict, score: int, label: str, zh_text: str, summary: str = "") -> str:
     url = f"https://x.com/{tweet['username']}/status/{tweet['id']}"
     metrics = tweet.get("metrics", {})
     engagement = f"{metrics.get('like_count', 0)} likes / {metrics.get('retweet_count', 0)} RT"
 
     icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}[label]
 
+    summary_block = ""
+    if summary:
+        zh_summary = translate_to_chinese(summary)
+        summary_block = (
+            f"<b>What happened:</b> {html.escape(summary)}\n"
+            f"<b>发生了什么:</b> {html.escape(zh_summary)}\n\n"
+        )
+
     msg = (
         f"{icon} <b>Risk: {label} ({score}/100)</b>\n"
         f"👤 @{html.escape(tweet['username'])} ({html.escape(tweet.get('name',''))})\n"
         f"📊 {engagement}\n\n"
-        f"<b>EN:</b> {html.escape(tweet['text'])}\n\n"
-        f"<b>中文:</b> {html.escape(zh_text)}\n\n"
+        f"{summary_block}"
+        f"<b>Original tweet (EN):</b> {html.escape(tweet['text'])}\n\n"
+        f"<b>原文翻译 (中文):</b> {html.escape(zh_text)}\n\n"
         f"🔗 {url}"
     )
     return msg
@@ -441,8 +466,18 @@ def run_self_test():
     print("Self-test message sent. Check your Telegram chat now.")
 
 
+def send_system_alert(message: str):
+    """
+    Sends a bot-health alert (distinct from incident alerts) — used when
+    the bot itself is broken (credits depleted, auth failure, etc.) so you
+    find out you've gone blind instead of silently missing coverage.
+    """
+    full_message = f"🔧 <b>BOT HEALTH ALERT</b>\n\n{message}"
+    send_telegram_alert(full_message)
+
+
 def run_once(since_id):
-    tweets, newest_id = search_recent_tweets(since_id)
+    tweets, newest_id, error = search_recent_tweets(since_id)
     if tweets:
         print(f"[{datetime.now(timezone.utc).isoformat()}] {len(tweets)} new candidate tweet(s).")
 
@@ -452,11 +487,11 @@ def run_once(since_id):
 
         ai_result = classify_with_ai(tweet["text"])
         if ai_result:
-            score, label, reasoning = ai_result
+            score, label, summary, reasoning = ai_result
             source = "AI"
         else:
             score, label = score_risk(tweet)  # fallback: keyword heuristic
-            reasoning = ""
+            summary, reasoning = "", ""
             source = "keyword"
 
         preview = tweet["text"][:80].replace("\n", " ")
@@ -476,12 +511,12 @@ def run_once(since_id):
             continue
 
         zh_text = translate_to_chinese(tweet["text"])
-        message = format_alert(tweet, score, label, zh_text)
+        message = format_alert(tweet, score, label, zh_text, summary)
         send_telegram_alert(message)
         print(f"    -> ALERT SENT")
         time.sleep(1)  # be gentle with Telegram's rate limits
 
-    return newest_id
+    return newest_id, error
 
 
 def main():
@@ -499,9 +534,42 @@ def main():
         run_self_test()
 
     since_id = None
+    consecutive_failures = 0
+    last_health_alert_at = None
+    HEALTH_ALERT_COOLDOWN_SECONDS = 1800  # don't re-page more than once per 30 min
+
     while True:
         try:
-            since_id = run_once(since_id)
+            since_id, error = run_once(since_id)
+
+            if error:
+                consecutive_failures += 1
+                print(f"Poll failed ({consecutive_failures} in a row): {error}", file=sys.stderr)
+
+                # Page immediately for unambiguous, important failures
+                # (credits depleted / bad auth), or after 3 consecutive
+                # failures for anything else — either way, respect a
+                # cooldown so a stuck failure doesn't spam Telegram.
+                is_urgent = "credits depleted" in error or "authentication failed" in error
+                should_alert = is_urgent or consecutive_failures >= 3
+                cooldown_elapsed = (
+                    last_health_alert_at is None
+                    or (datetime.now(timezone.utc) - last_health_alert_at).total_seconds()
+                    > HEALTH_ALERT_COOLDOWN_SECONDS
+                )
+                if should_alert and cooldown_elapsed:
+                    send_system_alert(
+                        f"The bot is failing to fetch tweets and may not be catching "
+                        f"real incidents right now.\n\n<b>Error:</b> {html.escape(error)}\n\n"
+                        f"Consecutive failures: {consecutive_failures}."
+                    )
+                    last_health_alert_at = datetime.now(timezone.utc)
+            else:
+                if consecutive_failures > 0:
+                    # We just recovered — let the user know it's back.
+                    send_system_alert("Bot has recovered and is fetching tweets normally again.")
+                consecutive_failures = 0
+
         except Exception as e:
             # Never let a single bad poll kill the 24/7 process.
             print(f"Unexpected error during poll: {e}", file=sys.stderr)
