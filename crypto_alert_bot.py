@@ -323,7 +323,7 @@ def classify_with_ai(tweet: dict):
         ).strip()
         text = text.replace("```json", "").replace("```", "").strip()
 
-        parsed = json.loads(text, strict=False)
+        parsed = json.loads(text)
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
         is_real = bool(parsed.get("is_real_incident", False))
         summary = parsed.get("summary", "").strip()
