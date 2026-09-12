@@ -243,6 +243,13 @@ or Render's dashboard (no code, no redeploy hassle):
   alerts.
 - `MIN_RISK_SCORE_TO_ALERT` (default 25) — raise to e.g. 45 to only get
   High/Critical alerts; lower to catch more.
+- `DEDUPE_WINDOW_HOURS` (default 12, requires `ANTHROPIC_API_KEY`) — how
+  long the bot remembers an already-alerted incident to suppress repeat
+  reports of the same story from different accounts. It still re-alerts
+  if a later tweet adds genuinely new info (updated loss figures, attacker
+  identified, funds frozen). Raise for less repetition, lower if you want
+  to see every account's version of a big story. Resets when the bot
+  restarts — a restart within the window may let one duplicate through.
 - `POLL_INTERVAL_SECONDS` (default 45) — how often it checks. Going lower
   than ~20s risks hitting X's rate limit (450 search calls/15 min).
 - `MAX_RESULTS` (default 25) — safety cap per poll, mainly matters during

@@ -45,6 +45,38 @@ INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "5"))
 # query operators (min_faves), so this reduces alert noise, not read cost.
 MIN_ENGAGEMENT_FILTER = int(os.environ.get("MIN_ENGAGEMENT_FILTER", "5"))
 
+# How long (hours) an alerted incident stays in memory for duplicate
+# detection. New reports of the same incident within this window get
+# suppressed by the AI unless they add genuinely new information.
+DEDUPE_WINDOW_HOURS = float(os.environ.get("DEDUPE_WINDOW_HOURS", "12"))
+DEDUPE_MAX_ENTRIES = 20  # cap memory size regardless of window
+
+# In-memory record of recently alerted incidents, so the AI can recognize
+# "this is the same story another account already told me about" instead
+# of re-alerting every time a different account tweets the same news.
+# Resets on restart — same caveat as since_id.
+recent_alerts: list[dict] = []
+
+
+def remember_alert(summary: str):
+    recent_alerts.append({"time": datetime.now(timezone.utc), "summary": summary})
+    prune_recent_alerts()
+
+
+def prune_recent_alerts():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=DEDUPE_WINDOW_HOURS)
+    while recent_alerts and recent_alerts[0]["time"] < cutoff:
+        recent_alerts.pop(0)
+    while len(recent_alerts) > DEDUPE_MAX_ENTRIES:
+        recent_alerts.pop(0)
+
+
+def recent_alerts_context() -> str:
+    prune_recent_alerts()
+    if not recent_alerts:
+        return "(none yet)"
+    return "\n".join(f"- {a['summary']}" for a in recent_alerts)
+
 # Common false-positive phrases that share words with our incident terms
 # but are almost never real crypto security incidents (growth hacking,
 # hackathons, unrelated giveaway/airdrop spam). Excluded directly in the
@@ -251,7 +283,18 @@ def classify_with_ai(tweet: dict):
         "source. 70-100 = confirmed MAJOR incident that is currently "
         "active or just happened, from a credible source or with strong "
         "supporting evidence — large funds lost, attacker still moving "
-        "funds, or critical infrastructure compromised."
+        "funds, or critical infrastructure compromised.\n\n"
+        "DUPLICATE CHECK — incidents already alerted on recently (within "
+        f"the last {DEDUPE_WINDOW_HOURS:.0f}h):\n{recent_alerts_context()}\n\n"
+        "If this tweet is reporting the SAME underlying incident as one "
+        "already listed above — even from a different account, with "
+        "different wording — set is_real_incident to FALSE and score low, "
+        "with reasoning noting it's a duplicate already alerted on. "
+        "EXCEPTION: if it adds genuinely new, material information (a "
+        "significantly updated loss figure, the attacker identified/"
+        "arrested, funds frozen or recovered, a new protocol/chain "
+        "affected that wasn't previously known), still report it — set "
+        "is_real_incident TRUE and note in the summary what's new."
     )
 
     user_message = f"Tweet author: @{username}\nTweet text: {tweet['text']}"
@@ -266,7 +309,7 @@ def classify_with_ai(tweet: dict):
             },
             json={
                 "model": AI_MODEL,
-                "max_tokens": 300,
+                "max_tokens": 150,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_message}],
             },
@@ -533,6 +576,8 @@ def run_once(since_id):
         zh_text = translate_to_chinese(tweet["text"])
         message = format_alert(tweet, score, label, zh_text, summary)
         send_telegram_alert(message)
+        if summary:
+            remember_alert(summary)  # so future duplicates of this get suppressed
         print(f"    -> ALERT SENT")
         time.sleep(1)  # be gentle with Telegram's rate limits
 
