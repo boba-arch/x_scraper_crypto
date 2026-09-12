@@ -322,6 +322,8 @@ def classify_with_ai(tweet: dict):
             if block.get("type") == "text"
         ).strip()
         text = text.replace("```json", "").replace("```", "").strip()
+        text = text.replace("\n", "\\n")  # fix: raw line breaks inside the
+        # summary field break JSON parsing — escape them safely here
 
         parsed = json.loads(text)
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
