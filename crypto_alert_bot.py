@@ -15,6 +15,7 @@ entirely through environment variables. See SETUP_GUIDE.md.
 
 import os
 import sys
+import re
 import time
 import html
 import json
@@ -98,15 +99,19 @@ INCIDENT_TERMS = [
     "exploit", "hacked", "breach", "drained", "compromised",
     "rugpull", "reentrancy", "private key leaked", "wallet drained",
     "bridge exploit",
+    # Post-hack fund movement / threat-actor tracking — distinct from an
+    # active fresh exploit, but valuable for spotting stolen funds heading
+    # toward an exchange. See the AI prompt's scoring guidance for how
+    # these are weighted differently from a fresh exploit.
+    "laundering", "launder", "lazarus",
 ]
 
-# NOTE: currently unused — build_query() now restricts search to
-# TRUSTED_ACCOUNTS only (from:...), which is far cheaper than matching
-# these context words across all of Twitter. Left here in case you ever
-# want to revert to a broader, non-source-restricted search.
+# Used to build the AND clause in build_query() alongside INCIDENT_TERMS
+# (search matches tweets containing an incident term AND a context term).
 CRYPTO_CONTEXT_TERMS = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
     "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
+    "eth", "btc", "sol",  # common cashtag tickers, not just full chain names
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
@@ -256,13 +261,17 @@ def classify_with_ai(tweet: dict):
         "alarming-sounding.\n\n"
         "You'll be told the tweet's author username. Weigh that alongside "
         "the tweet's own content.\n\n"
-        "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
+        "Respond with ONLY a JSON object, no other text, no markdown fences. "
+        "CRITICAL: the JSON must be valid — any line break inside a string "
+        "value must be written as the two characters backslash-n (\\n), "
+        "NEVER as an actual line break, or the JSON will fail to parse.\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
-        '"summary": "<Start with a line in EXACTLY this format: '
-        "'Affected project/tokens: <name(s), or \\'Unknown\\' if not stated>'. "
-        "Then, on a new line, 2-3 plain-English sentences explaining what "
-        "happened, in clear non-technical language a risk officer can act "
-        'on — what was exploited, how, and the scale of loss if known>", '
+        '"summary": "<Start with EXACTLY this format: '
+        "'Affected project/tokens: <name(s), or \\'Unknown\\' if not stated>.' "
+        "Then a \\\\n escape sequence, then 2-3 plain-English sentences "
+        "explaining what happened, in clear non-technical language a risk "
+        'officer can act on — what was exploited, how, and the scale of '
+        'loss if known>", '
         '"reasoning": "<one short sentence on why this score, including '
         'your source-credibility judgment>"}\n\n'
         "Set is_real_incident to FALSE if this is NOT a fresh or currently "
@@ -275,15 +284,28 @@ def classify_with_ai(tweet: dict):
         "newly disclosed, actively unfolding (funds still moving, "
         "investigation ongoing), or a meaningful update to a very recent "
         "incident (new loss figures, attacker identified, funds frozen).\n\n"
+        "SPECIAL CASE — known threat actor fund movement: some tweets "
+        "report a known threat actor (e.g. Lazarus Group) moving, "
+        "laundering, or cashing out PREVIOUSLY stolen funds, rather than a "
+        "fresh exploit. Still set is_real_incident TRUE for these — this is "
+        "valuable, actionable intel for an exchange risk officer, since "
+        "incoming funds from a known attacker can be flagged before they "
+        "land. Score these moderately (typically 30-50) UNLESS the funds "
+        "are explicitly moving toward a specific exchange or CEX deposit "
+        "address, in which case score higher (60+) since that's directly "
+        "actionable. Note in the summary which threat actor and where "
+        "funds are headed if stated.\n\n"
         "Scoring guide — weight recency, active status, AND source "
         "credibility heavily: 0-24 = not current, unsubstantiated, or from "
         "an unverified source with no supporting detail. 25-44 = confirmed, "
-        "small-scale, or recent but low-impact. 45-69 = confirmed, "
-        "moderate scale, actively unfolding or very recent, credible "
-        "source. 70-100 = confirmed MAJOR incident that is currently "
-        "active or just happened, from a credible source or with strong "
-        "supporting evidence — large funds lost, attacker still moving "
-        "funds, or critical infrastructure compromised.\n\n"
+        "small-scale, or recent but low-impact (or routine threat-actor "
+        "fund movement with no exchange destination stated). 45-69 = "
+        "confirmed, moderate scale, actively unfolding or very recent, "
+        "credible source. 70-100 = confirmed MAJOR incident that is "
+        "currently active or just happened, from a credible source or with "
+        "strong supporting evidence — large funds lost, attacker still "
+        "moving funds toward a specific destination, or critical "
+        "infrastructure compromised.\n\n"
         "DUPLICATE CHECK — incidents already alerted on recently (within "
         f"the last {DEDUPE_WINDOW_HOURS:.0f}h):\n{recent_alerts_context()}\n\n"
         "If this tweet is reporting the SAME underlying incident as one "
@@ -309,7 +331,7 @@ def classify_with_ai(tweet: dict):
             },
             json={
                 "model": AI_MODEL,
-                "max_tokens": 500,
+                "max_tokens": 150,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_message}],
             },
@@ -323,7 +345,21 @@ def classify_with_ai(tweet: dict):
         ).strip()
         text = text.replace("```json", "").replace("```", "").strip()
 
-        parsed = json.loads(text)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # Common failure mode: the model put a literal line break inside
+            # a string value instead of escaping it as \n. Try a repair
+            # pass — escape any raw newlines inside quoted strings — before
+            # giving up and falling back to keyword scoring.
+            repaired = re.sub(
+                r'"((?:[^"\\]|\\.)*)"',
+                lambda m: '"' + m.group(1).replace("\n", "\\n") + '"',
+                text,
+                flags=re.DOTALL,
+            )
+            parsed = json.loads(repaired)  # let this raise if still broken
+
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
         is_real = bool(parsed.get("is_real_incident", False))
         summary = parsed.get("summary", "").strip()
@@ -385,6 +421,59 @@ def score_risk(tweet: dict) -> tuple[int, str]:
         label = "LOW"
 
     return score, label
+
+
+# Maps how X writes chain names in "chain:0xaddress" references to the
+# platform ID CoinGecko's API expects.
+CHAIN_TO_COINGECKO_PLATFORM = {
+    "ethereum": "ethereum",
+    "bsc": "binance-smart-chain",
+    "polygon": "polygon-pos",
+    "arbitrum": "arbitrum-one",
+    "avalanche": "avalanche",
+}
+
+_token_symbol_cache: dict[str, str] = {}  # address -> symbol, avoids repeat lookups
+
+
+def resolve_token_symbols(text: str) -> str:
+    """
+    X's raw tweet text sometimes contains 'chain:0xaddress' references
+    where the tweet visually shows a token symbol like '$XPR' on x.com
+    (a display-only "smart tag" X adds — not present in the actual API
+    data). This looks up the real symbol via CoinGecko's free API and
+    substitutes it in as '$SYMBOL (0xaddr...)' so alerts are readable.
+    Best-effort: leaves text unchanged for anything that fails to resolve.
+    """
+    pattern = re.compile(r'\b(' + '|'.join(CHAIN_TO_COINGECKO_PLATFORM) + r'):(0x[a-fA-F0-9]{40})\b')
+
+    def replace_match(m):
+        chain, address = m.group(1), m.group(2)
+        cache_key = f"{chain}:{address.lower()}"
+        if cache_key in _token_symbol_cache:
+            symbol = _token_symbol_cache[cache_key]
+        else:
+            platform = CHAIN_TO_COINGECKO_PLATFORM[chain]
+            try:
+                resp = requests.get(
+                    f"https://api.coingecko.com/api/v3/coins/{platform}/contract/{address}",
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    symbol = resp.json().get("symbol", "").upper()
+                else:
+                    symbol = ""
+            except Exception as e:
+                print(f"Token symbol lookup failed for {cache_key}: {e}", file=sys.stderr)
+                symbol = ""
+            _token_symbol_cache[cache_key] = symbol
+
+        short_addr = f"{address[:6]}...{address[-4:]}"
+        if symbol:
+            return f"${symbol} ({short_addr})"
+        return m.group(0)  # couldn't resolve — leave the original text as-is
+
+    return pattern.sub(replace_match, text)
 
 
 def translate_to_chinese(text: str) -> str:
@@ -547,6 +636,10 @@ def run_once(since_id):
     for tweet in tweets:
         metrics = tweet.get("metrics", {})
         likes = metrics.get("like_count", 0)
+
+        # Resolve any 'chain:0xaddress' references to readable token
+        # symbols before this text is used anywhere downstream.
+        tweet["text"] = resolve_token_symbols(tweet["text"])
 
         ai_result = classify_with_ai(tweet)
         if ai_result:
