@@ -113,8 +113,8 @@ INCIDENT_TERMS = [
     "laundering", "launder", "lazarus",
     # Broader attack-vector and disclosure vocabulary — added once AI
     # scoring was trusted to filter the resulting noise.
-    "access control", "malicious", "unauthorized", "flash loan",
-    "oracle manipulation", "stolen", "incident",
+    "access control", "unauthorized", "flash loan",
+    "oracle manipulation", "stolen", "vulnerability", "frozen", "paused",
 ]
 
 # Used to build the AND clause in build_query() alongside INCIDENT_TERMS
@@ -122,7 +122,7 @@ INCIDENT_TERMS = [
 CRYPTO_CONTEXT_TERMS = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
     "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
-    "eth", "btc", "sol",  # common cashtag tickers, not just full chain names
+    "eth", "btc",  # common cashtag tickers, not just full chain names
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
