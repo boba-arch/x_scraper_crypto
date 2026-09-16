@@ -88,6 +88,13 @@ NOISE_EXCLUSIONS = ["hackathon", "giveaway", "airdrop"]
 # traffic bursts, since since_id tracking already prevents re-reads.
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "10"))
 
+# If a single poll finds more new matching tweets than MAX_RESULTS, this
+# caps how many additional pages we'll fetch to catch the rest — without
+# this, anything beyond the first page would be silently and permanently
+# skipped once since_id advances past it. Each extra page = one more
+# billed batch of reads, so this bounds worst-case cost per poll.
+PAGINATION_MAX_PAGES = int(os.environ.get("PAGINATION_MAX_PAGES", "3"))
+
 # Only alert if the computed risk score is at least this high (0-100).
 MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 
@@ -98,14 +105,16 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 INCIDENT_TERMS = [
     "exploit", "hacked", "breach", "drained", "compromised",
     "rugpull", "reentrancy", "private key leaked", "wallet drained",
-    "bridge exploit", "laundering", "launder", "lazarus",
-    "access control", "malicious", "unauthorized", "flash loan",
-    "oracle manipulation", "stolen", "incident",
-]
+    "bridge exploit",
     # Post-hack fund movement / threat-actor tracking — distinct from an
     # active fresh exploit, but valuable for spotting stolen funds heading
     # toward an exchange. See the AI prompt's scoring guidance for how
     # these are weighted differently from a fresh exploit.
+    "laundering", "launder", "lazarus",
+    # Broader attack-vector and disclosure vocabulary — added once AI
+    # scoring was trusted to filter the resulting noise.
+    "access control", "malicious", "unauthorized", "flash loan",
+    "oracle manipulation", "stolen", "incident",
 ]
 
 # Used to build the AND clause in build_query() alongside INCIDENT_TERMS
@@ -171,33 +180,30 @@ def search_recent_tweets(since_id: str | None):
         print("ERROR: X_BEARER_TOKEN is not set.", file=sys.stderr)
         sys.exit(1)
 
+    def fetch_page(pagination_token=None):
+        params = {
+            "query": build_query(),
+            "max_results": max(10, min(MAX_RESULTS, 100)),  # API requires 10-100
+            "tweet.fields": "created_at,public_metrics,author_id,text",
+            "expansions": "author_id",
+            "user.fields": "username,name,verified",
+        }
+        if since_id:
+            params["since_id"] = since_id
+        else:
+            lookback_seconds = max(INITIAL_LOOKBACK_MINUTES * 60, 60) + 30
+            start_time = (
+                datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            params["start_time"] = start_time
+        if pagination_token:
+            params["pagination_token"] = pagination_token
+        return requests.get(url, headers=headers, params=params, timeout=30)
+
     url = "https://api.twitter.com/2/tweets/search/recent"
     headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}"}
-    params = {
-        "query": build_query(),
-        "max_results": max(10, min(MAX_RESULTS, 100)),  # API requires 10-100
-        "tweet.fields": "created_at,public_metrics,author_id,text",
-        "expansions": "author_id",
-        "user.fields": "username,name,verified",
-    }
 
-    if since_id:
-        # Only fetch tweets newer than the last one we already processed —
-        # this is what keeps cost proportional to actual new incidents,
-        # not to how often we poll.
-        params["since_id"] = since_id
-    else:
-        # First run: just look back a few minutes so we don't backfill
-        # hours. Enforce a floor well above X's "must be 10+ seconds in
-        # the past" requirement, as a safety margin against any clock
-        # skew between this container and X's servers.
-        lookback_seconds = max(INITIAL_LOOKBACK_MINUTES * 60, 60) + 30
-        start_time = (
-            datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        params["start_time"] = start_time
-
-    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    resp = fetch_page()
 
     if resp.status_code == 402:
         return [], since_id, "X API credits depleted (402) — no credit left to fetch tweets."
@@ -211,12 +217,40 @@ def search_recent_tweets(since_id: str | None):
         return [], since_id, f"X API error {resp.status_code}: {resp.text[:200]}"
 
     data = resp.json()
-    tweets = data.get("data", [])
-    users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+    all_raw_tweets = list(data.get("data", []))
+    all_users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+
+    # newest_id must come from the FIRST page only — that's the true most
+    # recent tweet, used as next poll's since_id. Subsequent pages go
+    # backward in time from there.
+    newest_id = data.get("meta", {}).get("newest_id", since_id)
+
+    # If there were MORE new matches than fit on one page, keep paging —
+    # otherwise anything beyond the first page's cap would be silently and
+    # permanently skipped once since_id advances past it.
+    next_token = data.get("meta", {}).get("next_token")
+    pages_fetched = 1
+    while next_token and pages_fetched < PAGINATION_MAX_PAGES:
+        page_resp = fetch_page(pagination_token=next_token)
+        if page_resp.status_code != 200:
+            print(f"Pagination request failed ({page_resp.status_code}), "
+                  f"stopping early with what we have.", file=sys.stderr)
+            break
+        page_data = page_resp.json()
+        all_raw_tweets.extend(page_data.get("data", []))
+        all_users.update({u["id"]: u for u in page_data.get("includes", {}).get("users", [])})
+        next_token = page_data.get("meta", {}).get("next_token")
+        pages_fetched += 1
+
+    if next_token:
+        print(f"NOTE: more new tweets exist beyond PAGINATION_MAX_PAGES="
+              f"{PAGINATION_MAX_PAGES} ({pages_fetched} pages fetched) — "
+              f"some may be missed this poll. Consider raising it if this "
+              f"happens often.", file=sys.stderr)
 
     results = []
-    for t in tweets:
-        author = users.get(t.get("author_id"), {})
+    for t in all_raw_tweets:
+        author = all_users.get(t.get("author_id"), {})
         results.append({
             "id": t["id"],
             "text": t["text"],
@@ -226,8 +260,6 @@ def search_recent_tweets(since_id: str | None):
             "name": author.get("name", ""),
         })
 
-    # meta.newest_id tells us where to resume from next poll
-    newest_id = data.get("meta", {}).get("newest_id", since_id)
     return results, newest_id, None
 
 
