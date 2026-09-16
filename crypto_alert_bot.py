@@ -106,7 +106,6 @@ INCIDENT_TERMS = [
     # active fresh exploit, but valuable for spotting stolen funds heading
     # toward an exchange. See the AI prompt's scoring guidance for how
     # these are weighted differently from a fresh exploit.
-    "laundering", "launder", "lazarus",
 ]
 
 # Used to build the AND clause in build_query() alongside INCIDENT_TERMS
