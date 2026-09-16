@@ -98,7 +98,10 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 INCIDENT_TERMS = [
     "exploit", "hacked", "breach", "drained", "compromised",
     "rugpull", "reentrancy", "private key leaked", "wallet drained",
-    "bridge exploit",
+    "bridge exploit", "laundering", "launder", "lazarus",
+    "access control", "malicious", "unauthorized", "flash loan",
+    "oracle manipulation", "stolen", "incident",
+]
     # Post-hack fund movement / threat-actor tracking — distinct from an
     # active fresh exploit, but valuable for spotting stolen funds heading
     # toward an exchange. See the AI prompt's scoring guidance for how
