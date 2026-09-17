@@ -50,7 +50,7 @@ MIN_ENGAGEMENT_FILTER = int(os.environ.get("MIN_ENGAGEMENT_FILTER", "5"))
 # detection. New reports of the same incident within this window get
 # suppressed by the AI unless they add genuinely new information.
 DEDUPE_WINDOW_HOURS = float(os.environ.get("DEDUPE_WINDOW_HOURS", "12"))
-DEDUPE_MAX_ENTRIES = 20  # cap memory size regardless of window
+DEDUPE_MAX_ENTRIES = int(os.environ.get("DEDUPE_MAX_ENTRIES", "10"))  # cap memory size regardless of window
 
 # In-memory record of recently alerted incidents, so the AI can recognize
 # "this is the same story another account already told me about" instead
