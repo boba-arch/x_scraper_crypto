@@ -30,8 +30,14 @@ X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recommended
-XAI_API_KEY = os.environ.get("XAI_API_KEY")  # optional — enables AI scoring (Grok)
-AI_MODEL = os.environ.get("AI_MODEL", "grok-4.3")
+
+# AI scoring uses Claude as the primary provider, with automatic failover to
+# Grok if Claude is unreachable/erroring — you only get paged on Telegram if
+# BOTH fail. Set whichever key(s) you have; at least one is required.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # primary provider (Claude)
+XAI_API_KEY = os.environ.get("XAI_API_KEY")  # fallback provider (Grok)
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
@@ -115,6 +121,76 @@ def recent_alerts_context() -> str:
     return "\n".join(f"- {a['summary']}" for a in recent_alerts)
 
 
+def _call_claude(system_prompt: str, user_message: str, max_tokens: int) -> str:
+    """Calls Anthropic's Claude API. Raises on any failure — caller handles fallback."""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": CLAUDE_MODEL,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_message}],
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["content"][0]["text"].strip()
+
+
+def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
+    """Calls xAI's Grok API. Raises on any failure — caller handles fallback."""
+    resp = requests.post(
+        "https://api.x.ai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROK_MODEL,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def call_ai(system_prompt: str, user_message: str, max_tokens: int = 500):
+    """
+    Calls the configured AI provider(s) with automatic failover: tries
+    Claude first (primary) if ANTHROPIC_API_KEY is set, and only falls back
+    to Grok if Claude errors or isn't configured. Returns (text,
+    provider_name) on success, or (None, None) if every configured
+    provider failed. There is no keyword-based fallback — callers should
+    treat (None, None) as "AI unreachable": skip the tweet/case and page on
+    Telegram (see note_ai_failure_and_maybe_alert()).
+    """
+    if ANTHROPIC_API_KEY:
+        try:
+            return _call_claude(system_prompt, user_message, max_tokens), "claude"
+        except Exception as e:
+            print(f"Claude API call failed, trying Grok fallback: {e}", file=sys.stderr)
+
+    if XAI_API_KEY:
+        try:
+            return _call_grok(system_prompt, user_message, max_tokens), "grok"
+        except Exception as e:
+            print(f"Grok API call failed: {e}", file=sys.stderr)
+
+    return None, None
+
+
 def generate_case_report_text(case_key: str, case: dict) -> str:
     """
     Asks Claude to synthesize one case's full update history into a single
@@ -147,32 +223,12 @@ def generate_case_report_text(case_key: str, case: dict) -> str:
         "updates don't actually cover. Plain text only, no JSON, no "
         "markdown headers — just the readout itself."
     )
-    if not XAI_API_KEY:
+    text, provider = call_ai(system_prompt, updates_text, max_tokens=400)
+    if not text:
+        print(f"Case report generation failed for {case_key}: both Claude and "
+              f"Grok were unreachable/erroring.", file=sys.stderr)
         return None
-    try:
-        resp = requests.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {XAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": AI_MODEL,
-                "max_tokens": 400,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": updates_text},
-                ],
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data["choices"][0]["message"]["content"].strip()
-        return text
-    except Exception as e:
-        print(f"Case report generation failed for {case_key}: {e}", file=sys.stderr)
-        return None
+    return text
 
 
 def send_periodic_case_report():
@@ -460,14 +516,16 @@ def search_recent_tweets(since_id: str | None):
 
 def classify_with_ai(tweet: dict):
     """
-    Asks Grok to judge whether a tweet describes a real, currently-active
-    crypto security incident and assign a risk score. Returns
+    Asks the AI (Claude primary, Grok fallback — see call_ai()) to judge
+    whether a tweet describes a real, currently-active crypto security
+    incident and assign a risk score. Returns
     (score, label, summary, reasoning, case_key), or None if AI scoring
-    isn't configured or the call fails. There is no keyword-based fallback —
-    scoring is AI-only, so callers should skip the tweet and page on
-    Telegram when this returns None (see note_ai_failure_and_maybe_alert()).
+    isn't configured or every provider's call fails. There is no
+    keyword-based fallback — scoring is AI-only, so callers should skip the
+    tweet and page on Telegram when this returns None (see
+    note_ai_failure_and_maybe_alert()).
     """
-    if not XAI_API_KEY:
+    if not ANTHROPIC_API_KEY and not XAI_API_KEY:
         return None
 
     username = tweet.get("username", "unknown")
@@ -608,26 +666,13 @@ def classify_with_ai(tweet: dict):
         f"Tweet text: {tweet['text']}"
     )
 
+    text, provider = call_ai(system_prompt, user_message, max_tokens=500)
+    if not text:
+        print("AI classification failed: both Claude and Grok were "
+              "unreachable/erroring.", file=sys.stderr)
+        return None
+
     try:
-        resp = requests.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {XAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": AI_MODEL,
-                "max_tokens": 500,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data["choices"][0]["message"]["content"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
 
         try:
@@ -664,8 +709,8 @@ def classify_with_ai(tweet: dict):
         return score, label, summary, reasoning, case_key
 
     except Exception as e:
-        print(f"AI classification failed: {e}",
-              file=sys.stderr)
+        print(f"AI response from {provider} couldn't be parsed: {e}\n"
+              f"  Raw response was: {text!r}", file=sys.stderr)
         return None
 
 
@@ -879,12 +924,13 @@ def run_self_test():
 
     ai_result = classify_with_ai(test_tweet)
     if not ai_result:
-        print("AI classification failed or is unreachable — scoring is AI-only now, "
-              "so no alert can be sent. Check XAI_API_KEY and the xAI API status.",
+        print("AI classification failed — both Claude and Grok were unreachable/"
+              "erroring, or neither is configured. Scoring is AI-only now, so no "
+              "alert can be sent. Check ANTHROPIC_API_KEY / XAI_API_KEY.",
               file=sys.stderr)
         send_system_alert(
-            "Self-test: AI classification (Grok) failed. Scoring is AI-only — "
-            "check XAI_API_KEY / xAI status."
+            "Self-test: AI classification failed on both Claude and Grok. "
+            "Scoring is AI-only — check ANTHROPIC_API_KEY / XAI_API_KEY."
         )
         return
 
@@ -909,10 +955,11 @@ def send_system_alert(message: str):
     send_telegram_alert(full_message)
 
 
-# Scoring is AI-only now — no keyword-based fallback. If Grok is
-# unreachable, tweets during that window are skipped (not silently
-# keyword-scored) and you're paged on Telegram instead, cooldown-guarded so
-# a stuck outage doesn't spam you once per tweet.
+# Scoring is AI-only — no keyword-based fallback. classify_with_ai()
+# already tries Claude, then Grok, before giving up (see call_ai()); this
+# only fires once BOTH have failed. Tweets during that window are skipped
+# (not silently keyword-scored) and you're paged on Telegram instead,
+# cooldown-guarded so a stuck outage doesn't spam you once per tweet.
 _last_ai_failure_alert_at = None
 AI_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
 
@@ -926,10 +973,11 @@ def note_ai_failure_and_maybe_alert():
     )
     if cooldown_elapsed:
         send_system_alert(
-            "AI classification (Grok) is unreachable or failing. Scoring is "
-            "AI-only — tweets are being SKIPPED (not keyword-scored) until "
-            "this recovers, so you may be missing real incidents right now. "
-            "Check XAI_API_KEY / xAI status."
+            "AI classification is unreachable or failing on BOTH Claude and "
+            "Grok (or neither is configured). Scoring is AI-only — tweets "
+            "are being SKIPPED (not keyword-scored) until this recovers, so "
+            "you may be missing real incidents right now. Check "
+            "ANTHROPIC_API_KEY / XAI_API_KEY."
         )
         _last_ai_failure_alert_at = now
 
@@ -997,6 +1045,19 @@ def main():
               "TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.", file=sys.stderr)
         sys.exit(1)
 
+    if not ANTHROPIC_API_KEY and not XAI_API_KEY:
+        print("ERROR: Neither ANTHROPIC_API_KEY nor XAI_API_KEY is set. "
+              "Scoring is AI-only — the bot cannot classify any tweets "
+              "without at least one of these configured.", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        "AI provider(s): "
+        + (f"Claude ({CLAUDE_MODEL}) primary" if ANTHROPIC_API_KEY else "Claude NOT configured")
+        + ", "
+        + (f"Grok ({GROK_MODEL}) fallback" if XAI_API_KEY else "Grok NOT configured")
+    )
+
     if os.environ.get("SELF_TEST_ON_START", "false").lower() == "true":
         run_self_test()
 
@@ -1010,7 +1071,7 @@ def main():
         try:
             since_id, error = run_once(since_id)
 
-            if REPORT_INTERVAL_HOURS > 0 and XAI_API_KEY:
+            if REPORT_INTERVAL_HOURS > 0 and (ANTHROPIC_API_KEY or XAI_API_KEY):
                 hours_since_report = (datetime.now(timezone.utc) - last_report_at).total_seconds() / 3600
                 if hours_since_report >= REPORT_INTERVAL_HOURS:
                     send_periodic_case_report()
