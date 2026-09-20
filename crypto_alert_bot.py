@@ -30,8 +30,8 @@ X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recommended
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # optional — enables AI scoring
-AI_MODEL = os.environ.get("AI_MODEL", "claude-haiku-4-5-20251001")
+XAI_API_KEY = os.environ.get("XAI_API_KEY")  # optional — enables AI scoring (Grok)
+AI_MODEL = os.environ.get("AI_MODEL", "grok-4.3")
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
@@ -58,6 +58,42 @@ DEDUPE_MAX_ENTRIES = int(os.environ.get("DEDUPE_MAX_ENTRIES", "10"))  # cap memo
 # Resets on restart — same caveat as since_id.
 recent_alerts: list[dict] = []
 
+# --- Periodic case-report feature ---------------------------------------
+# How often (hours) to send a consolidated digest grouping updates by
+# incident ("case"). Set to 0 to disable this feature entirely.
+REPORT_INTERVAL_HOURS = float(os.environ.get("REPORT_INTERVAL_HOURS", "6"))
+# How long (hours) a case stays tracked/reportable after its last update,
+# before being dropped from memory to bound cost and message size.
+CASE_RETENTION_HOURS = float(os.environ.get("CASE_RETENTION_HOURS", "72"))
+
+# In-memory incident tracker: case_key -> {"first_seen", "last_seen",
+# "updates": [{"time", "summary", "score", "label", "username"}, ...]}.
+# Populated every time a real alert fires (see run_once). Resets on
+# restart — same caveat as since_id / recent_alerts.
+cases: dict[str, dict] = {}
+
+
+def record_case_update(case_key: str, tweet: dict, score: int, label: str, summary: str):
+    now = datetime.now(timezone.utc)
+    if case_key not in cases:
+        cases[case_key] = {"first_seen": now, "last_seen": now, "updates": []}
+    case = cases[case_key]
+    case["last_seen"] = now
+    case["updates"].append({
+        "time": now,
+        "summary": summary,
+        "score": score,
+        "label": label,
+        "username": tweet.get("username", "unknown"),
+    })
+
+
+def prune_stale_cases():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=CASE_RETENTION_HOURS)
+    stale = [k for k, c in cases.items() if c["last_seen"] < cutoff]
+    for k in stale:
+        del cases[k]
+
 
 def remember_alert(summary: str):
     recent_alerts.append({"time": datetime.now(timezone.utc), "summary": summary})
@@ -77,6 +113,109 @@ def recent_alerts_context() -> str:
     if not recent_alerts:
         return "(none yet)"
     return "\n".join(f"- {a['summary']}" for a in recent_alerts)
+
+
+def generate_case_report_text(case_key: str, case: dict) -> str:
+    """
+    Asks Claude to synthesize one case's full update history into a single
+    current-status readout — explicitly answering the kind of questions a
+    risk officer wants (attacker caught? funds frozen/recovered? latest
+    status?) rather than just listing raw updates. Returns plain text, or
+    None if the call fails (caller should skip this case for this report
+    rather than fail the whole digest).
+    """
+    updates_text = "\n".join(
+        f"[{u['time'].strftime('%Y-%m-%d %H:%M UTC')}] (@{u['username']}, "
+        f"{u['label']} {u['score']}) {u['summary']}"
+        for u in case["updates"]
+    )
+    system_prompt = (
+        "You are a crypto security analyst writing a status update for a "
+        "risk officer at an exchange, synthesizing everything tracked so "
+        "far about ONE ongoing incident into a short current-status "
+        "readout. You'll be given a chronological list of updates about "
+        "this case.\n\n"
+        "Write 3-5 sentences covering, as far as the updates allow you to "
+        "determine: (1) what happened and to which project/protocol, (2) "
+        "the current status — is it still unfolding or has it stabilized, "
+        "(3) explicitly state whether the attacker has been identified or "
+        "caught (say 'not stated' if the updates don't say), (4) "
+        "explicitly state whether funds have been frozen or recovered "
+        "(say 'not stated' if unclear), (5) total financial impact if "
+        "known. Be direct and factual — don't pad with filler, and "
+        "explicitly say 'not stated' rather than guessing at anything the "
+        "updates don't actually cover. Plain text only, no JSON, no "
+        "markdown headers — just the readout itself."
+    )
+    if not XAI_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {XAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": AI_MODEL,
+                "max_tokens": 400,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": updates_text},
+                ],
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        return text
+    except Exception as e:
+        print(f"Case report generation failed for {case_key}: {e}", file=sys.stderr)
+        return None
+
+
+def send_periodic_case_report():
+    """
+    Builds and sends a Telegram digest with one consolidated status
+    readout per actively-tracked case. Skips sending entirely if there
+    are no cases to report (avoids empty noise messages).
+    """
+    prune_stale_cases()
+    if not cases:
+        print("Periodic report: no active cases to report, skipping.")
+        return
+
+    print(f"Generating periodic case report for {len(cases)} case(s)...")
+    sections = []
+    for case_key, case in sorted(cases.items(), key=lambda kv: kv[1]["last_seen"], reverse=True):
+        report_text = generate_case_report_text(case_key, case)
+        if not report_text:
+            continue
+        title = case_key.replace("_", " ").title()
+        sections.append(
+            f"📋 <b>{html.escape(title)}</b>\n"
+            f"<i>{len(case['updates'])} update(s), last seen "
+            f"{case['last_seen'].strftime('%Y-%m-%d %H:%M UTC')}</i>\n\n"
+            f"{html.escape(report_text)}"
+        )
+
+    if not sections:
+        return  # every case's report generation failed — nothing usable to send
+
+    header = f"🗞️ <b>PERIODIC CASE REPORT</b> — {len(sections)} active case(s)\n\n"
+    body = header + "\n\n————————\n\n".join(sections)
+
+    # Telegram caps messages at 4096 chars — split into multiple messages
+    # rather than truncating and silently losing content.
+    TELEGRAM_LIMIT = 4000  # small safety margin below the actual 4096 cap
+    if len(body) <= TELEGRAM_LIMIT:
+        send_telegram_alert(body)
+    else:
+        send_telegram_alert(header + "(report split across multiple messages)")
+        for section in sections:
+            send_telegram_alert(section)
+            time.sleep(1)
 
 # Common false-positive phrases that share words with our incident terms
 # but are almost never real crypto security incidents (growth hacking,
@@ -102,7 +241,16 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 # Keyword / query strategy
 # ---------------------------------------------------------------------------
 
-INCIDENT_TERMS = [
+# We run TWO separate X searches every poll instead of one. Query A covers
+# hard, unambiguous attack vocabulary ("exploit", "hacked", ...). Query B
+# covers the softer, "official statement" vocabulary that real incidents
+# often surface with FIRST — before anyone has confirmed it's an exploit
+# (e.g. "network paused", "under investigation") — which was the exact
+# pattern that caused earlier misses (MultiversX, Ofero Network). Running
+# both costs roughly 2x the reads of a single query, which the user has
+# explicitly said is an acceptable tradeoff for earlier/broader coverage.
+
+INCIDENT_TERMS_A = [
     "exploit", "hacked", "breach", "drained", "compromised",
     "rugpull", "reentrancy", "private key leaked", "wallet drained",
     "bridge exploit",
@@ -114,15 +262,33 @@ INCIDENT_TERMS = [
     # Broader attack-vector and disclosure vocabulary — added once AI
     # scoring was trusted to filter the resulting noise.
     "access control", "unauthorized", "flash loan",
-    "oracle manipulation", "stolen", "vulnerability", "frozen", "paused",
+    "oracle manipulation", "stolen", "phishing",
 ]
 
-# Used to build the AND clause in build_query() alongside INCIDENT_TERMS
-# (search matches tweets containing an incident term AND a context term).
-CRYPTO_CONTEXT_TERMS = [
+# Context (crypto-relevance) terms ANDed against INCIDENT_TERMS_A.
+CONTEXT_A = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
     "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
     "eth", "btc",  # common cashtag tickers, not just full chain names
+    "blockchain", "mainnet",
+]
+
+# Query B: softer/operational-disclosure vocabulary — official-sounding
+# statements that often appear before "exploit"/"hacked" is ever used.
+INCIDENT_TERMS_B = [
+    "halted", "suspended", "paused", "frozen", "vulnerability",
+    "incident", "security incident", "under investigation",
+    "security investigation", "potential issue", "validators paused",
+    "network paused", "temporarily unavailable",
+]
+
+# Context terms ANDed against INCIDENT_TERMS_B. Broader than CONTEXT_A
+# (adds "network"/"validators") since query B's incident terms are vaguer
+# on their own and need the extra context words to stay on-topic.
+CONTEXT_B = [
+    "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
+    "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
+    "eth", "btc", "blockchain", "mainnet", "network", "validators",
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
@@ -133,32 +299,10 @@ TRUSTED_ACCOUNTS = {
     "bitcoin_infoBTC", "whale_alert", "exvulsec",
 }
 
-# Words that indicate the incident is resolved/false-positive/hypothetical —
-# used to reduce score and cut noise.
-DAMPENERS = [
-    "patched", "resolved", "false alarm", "test transaction", "not a hack",
-    "rumor", "unconfirmed", "hypothetical", "simulation", "poc only",
-]
 
-HIGH_SEVERITY = [
-    "drained", "private key leaked", "seed phrase", "wallet drained",
-    "unauthorized withdrawal", "bridge exploit", "exploited",
-]
-
-MEDIUM_SEVERITY = [
-    "exploit", "hacked", "hack", "breach", "compromised", "rug pull",
-    "rugpull", "reentrancy", "flash loan attack", "oracle manipulation",
-]
-
-LOW_SEVERITY = [
-    "incident", "vulnerability", "smart contract vulnerability",
-    "security incident",
-]
-
-
-def build_query() -> str:
-    incident_clause = " OR ".join(f'"{t}"' if " " in t else t for t in INCIDENT_TERMS)
-    context_clause = " OR ".join(CRYPTO_CONTEXT_TERMS)
+def _build_one_query(incident_terms: list[str], context_terms: list[str]) -> str:
+    incident_clause = " OR ".join(f'"{t}"' if " " in t else t for t in incident_terms)
+    context_clause = " OR ".join(context_terms)
     exclusions = " ".join(
         f'-"{t}"' if " " in t else f"-{t}" for t in NOISE_EXCLUSIONS
     )
@@ -169,20 +313,24 @@ def build_query() -> str:
     return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet -is:quote lang:en"
 
 
-def search_recent_tweets(since_id: str | None):
-    """
-    Returns (tweets, newest_id, error_message). error_message is None on
-    success (even if zero tweets matched — that's a normal quiet period,
-    not a failure). It's set to a short description on any API error, so
-    the caller can distinguish "nothing happened" from "something broke".
-    """
-    if not X_BEARER_TOKEN:
-        print("ERROR: X_BEARER_TOKEN is not set.", file=sys.stderr)
-        sys.exit(1)
+def build_queries() -> list[str]:
+    """Returns the two X search query strings run every poll (A: hard attack
+    vocabulary, B: soft/operational-disclosure vocabulary)."""
+    return [
+        _build_one_query(INCIDENT_TERMS_A, CONTEXT_A),
+        _build_one_query(INCIDENT_TERMS_B, CONTEXT_B),
+    ]
 
+
+def _search_one_query(query: str, since_id: str | None):
+    """
+    Runs a single X search query (with pagination). Returns
+    (tweets, newest_id, error_message) — same contract as
+    search_recent_tweets(), but for one query string only.
+    """
     def fetch_page(pagination_token=None):
         params = {
-            "query": build_query(),
+            "query": query,
             "max_results": max(10, min(MAX_RESULTS, 100)),  # API requires 10-100
             "tweet.fields": "created_at,public_metrics,author_id,text",
             "expansions": "author_id",
@@ -244,9 +392,9 @@ def search_recent_tweets(since_id: str | None):
 
     if next_token:
         print(f"NOTE: more new tweets exist beyond PAGINATION_MAX_PAGES="
-              f"{PAGINATION_MAX_PAGES} ({pages_fetched} pages fetched) — "
-              f"some may be missed this poll. Consider raising it if this "
-              f"happens often.", file=sys.stderr)
+              f"{PAGINATION_MAX_PAGES} ({pages_fetched} pages fetched) for "
+              f"this query — some may be missed this poll. Consider raising "
+              f"it if this happens often.", file=sys.stderr)
 
     results = []
     for t in all_raw_tweets:
@@ -258,20 +406,68 @@ def search_recent_tweets(since_id: str | None):
             "metrics": t.get("public_metrics", {}),
             "username": author.get("username", "unknown"),
             "name": author.get("name", ""),
+            "verified": bool(author.get("verified", False)),
         })
 
     return results, newest_id, None
 
 
+def search_recent_tweets(since_id: str | None):
+    """
+    Runs BOTH X search queries (build_queries()) every poll, merges and
+    dedupes the results by tweet ID, and reconciles a single since_id for
+    the next poll. Tweet IDs are Twitter Snowflake IDs, which are globally
+    time-ordered across all of Twitter regardless of which query matched —
+    so it's safe (and simplest) to use one shared since_id watermark, taken
+    as the max newest_id seen across both queries, for both queries on the
+    next poll.
+
+    Returns (tweets, newest_id, error_message) — same contract as before.
+    error_message is None on success (even with zero matches — that's a
+    normal quiet period). If EITHER query errors, that error is reported,
+    but results from the other query (if it succeeded) are still returned
+    and used, so one query having trouble doesn't blind the whole poll.
+    """
+    if not X_BEARER_TOKEN:
+        print("ERROR: X_BEARER_TOKEN is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    queries = build_queries()
+    combined_by_id: dict[str, dict] = {}
+    newest_id = since_id
+    errors = []
+
+    for i, query in enumerate(queries, start=1):
+        tweets, q_newest_id, error = _search_one_query(query, since_id)
+        if error:
+            print(f"Query {i} of {len(queries)} failed: {error}", file=sys.stderr)
+            errors.append(error)
+        for t in tweets:
+            combined_by_id[t["id"]] = t  # dedupe by tweet ID
+        # Numeric comparison — Snowflake IDs are time-ordered but can exceed
+        # 64-bit-safe float precision, so compare as int, not string/lexical.
+        if q_newest_id and (newest_id is None or int(q_newest_id) > int(newest_id)):
+            newest_id = q_newest_id
+
+    # Only treat this as a hard failure if EVERY query failed with no
+    # results at all — a partial failure still yields usable tweets.
+    error_message = None
+    if errors and not combined_by_id:
+        error_message = errors[0]
+
+    return list(combined_by_id.values()), newest_id, error_message
+
+
 def classify_with_ai(tweet: dict):
     """
-    Asks Claude to judge whether a tweet describes a real, currently-active
+    Asks Grok to judge whether a tweet describes a real, currently-active
     crypto security incident and assign a risk score. Returns
-    (score, label, summary, reasoning) or None if AI scoring isn't
-    configured or the call fails — callers should fall back to the
-    keyword-based score_risk() in that case.
+    (score, label, summary, reasoning, case_key), or None if AI scoring
+    isn't configured or the call fails. There is no keyword-based fallback —
+    scoring is AI-only, so callers should skip the tweet and page on
+    Telegram when this returns None (see note_ai_failure_and_maybe_alert()).
     """
-    if not ANTHROPIC_API_KEY:
+    if not XAI_API_KEY:
         return None
 
     username = tweet.get("username", "unknown")
@@ -293,13 +489,25 @@ def classify_with_ai(tweet: dict):
         "evidence) to be treated as credible — vague claims with no "
         "specifics from an unknown source should score low even if "
         "alarming-sounding.\n\n"
-        "You'll be told the tweet's author username. Weigh that alongside "
-        "the tweet's own content.\n\n"
+        "You'll be told the tweet's author username and whether X has "
+        "verified that account. A verified account (especially a project's "
+        "own official account) is a meaningful credibility signal on its "
+        "own — weigh it alongside the tweet's content, even if the account "
+        "isn't on the named trusted-researcher list.\n\n"
         "Respond with ONLY a JSON object, no other text, no markdown fences. "
         "CRITICAL: the JSON must be valid — any line break inside a string "
         "value must be written as the two characters backslash-n (\\n), "
         "NEVER as an actual line break, or the JSON will fail to parse.\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
+        '"case_key": "<a short, STABLE identifier for this incident, '
+        "lowercase, words separated by underscores, based on the "
+        "project/protocol name + incident type, e.g. 'liquid_network_"
+        "exploit', 'vyfi_safeswaps_exploit'. Use the SAME key you would "
+        "use for any other tweet about this same incident, regardless of "
+        "who's tweeting or how they phrase it — this is used to group "
+        "updates about the same case together. If truly no project/"
+        "protocol name is identifiable, use 'unknown_' plus a few words "
+        'describing the incident type.>", '
         '"summary": "<Start with EXACTLY this format: '
         "'Affected project/tokens: <name(s), or \\'Unknown\\' if not stated>.' "
         "Then a \\\\n escape sequence, then 2-3 plain-English sentences "
@@ -342,6 +550,34 @@ def classify_with_ai(tweet: dict):
         "is_real_incident FALSE and score LOW (10-20) — regardless of how "
         "detailed or alarming the incident recap itself is, and even if "
         "you haven't seen this specific incident mentioned before.\n\n"
+        "SPECIAL CASE — official first-party operational disclosure: some "
+        "tweets are an official project/platform account announcing that "
+        "operations are disrupted by a halt, pause, or security "
+        "investigation. This covers TWO situations, treated the same way: "
+        "(a) the account's OWN network/protocol has halted, paused "
+        "validation, or is under investigation (e.g. 'mainnet validation is "
+        "temporarily paused during a security investigation'), OR (b) the "
+        "account runs a platform/service BUILT ON another chain or "
+        "protocol, and is telling its users that ITS service (transfers, "
+        "withdrawals, cashbacks, deposits, etc.) is disrupted because that "
+        "underlying chain/protocol is paused or under a security "
+        "investigation, even if the underlying network isn't the account's "
+        "own. Both are inherently credible even though it's not on the "
+        "trusted researcher list and no third party has confirmed it — an "
+        "official channel does not tell its own users their funds/transfers "
+        "are affected unless something real is happening. Do NOT downgrade "
+        "for lacking outside confirmation or a stated loss figure, and do "
+        "NOT downgrade case (b) just because the halted network belongs to "
+        "a different project than the tweeting account — the disruption to "
+        "the tweeting account's own users is what matters. Set "
+        "is_real_incident TRUE and score at least 65-80 by default. Score "
+        "at the HIGH end of that range (75+) when the account is VERIFIED, "
+        "when user funds/withdrawals/transfers/deposits are explicitly "
+        "affected, or both — this combination should essentially always "
+        "clear 70. This is a materially different situation from an "
+        "unverified rando making claims — an official channel disclosing "
+        "impact to its own users is itself the actionable signal, so don't "
+        "undersell it while waiting for more details.\n\n"
         "Scoring guide — weight recency, active status, AND source "
         "credibility heavily: 0-24 = not current, unsubstantiated, or from "
         "an unverified source with no supporting detail. 25-44 = confirmed, "
@@ -366,30 +602,32 @@ def classify_with_ai(tweet: dict):
         "is_real_incident TRUE and note in the summary what's new."
     )
 
-    user_message = f"Tweet author: @{username}\nTweet text: {tweet['text']}"
+    verified_note = "verified" if tweet.get("verified") else "not verified"
+    user_message = (
+        f"Tweet author: @{username} ({verified_note} account)\n"
+        f"Tweet text: {tweet['text']}"
+    )
 
     try:
         resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.x.ai/v1/chat/completions",
             headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "Authorization": f"Bearer {XAI_API_KEY}",
+                "Content-Type": "application/json",
             },
             json={
                 "model": AI_MODEL,
                 "max_tokens": 500,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_message}],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
             },
             timeout=20,
         )
         resp.raise_for_status()
         data = resp.json()
-        text = "".join(
-            block.get("text", "") for block in data.get("content", [])
-            if block.get("type") == "text"
-        ).strip()
+        text = data["choices"][0]["message"]["content"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
 
         try:
@@ -398,7 +636,7 @@ def classify_with_ai(tweet: dict):
             # Common failure mode: the model put a literal line break inside
             # a string value instead of escaping it as \n. Try a repair
             # pass — escape any raw newlines inside quoted strings — before
-            # giving up and falling back to keyword scoring.
+            # giving up and treating this as a failed classification.
             repaired = re.sub(
                 r'"((?:[^"\\]|\\.)*)"',
                 lambda m: '"' + m.group(1).replace("\n", "\\n") + '"',
@@ -411,6 +649,7 @@ def classify_with_ai(tweet: dict):
         is_real = bool(parsed.get("is_real_incident", False))
         summary = parsed.get("summary", "").strip()
         reasoning = parsed.get("reasoning", "").strip()
+        case_key = parsed.get("case_key", "").strip().lower() or "unknown_incident"
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
 
@@ -422,52 +661,12 @@ def classify_with_ai(tweet: dict):
             label = "MEDIUM"
         else:
             label = "LOW"
-        return score, label, summary, reasoning
+        return score, label, summary, reasoning, case_key
 
     except Exception as e:
-        print(f"AI classification failed, falling back to keyword scoring: {e}",
+        print(f"AI classification failed: {e}",
               file=sys.stderr)
         return None
-
-
-def score_risk(tweet: dict) -> tuple[int, str]:
-    text_lower = tweet["text"].lower()
-    score = 0
-
-    if any(term in text_lower for term in HIGH_SEVERITY):
-        score += 45
-    elif any(term in text_lower for term in MEDIUM_SEVERITY):
-        score += 30
-    elif any(term in text_lower for term in LOW_SEVERITY):
-        score += 15
-
-    if tweet["username"].lower() in TRUSTED_ACCOUNTS:
-        score += 25
-
-    metrics = tweet.get("metrics", {})
-    engagement = metrics.get("like_count", 0) + metrics.get("retweet_count", 0) * 2
-    if engagement >= 500:
-        score += 20
-    elif engagement >= 100:
-        score += 12
-    elif engagement >= 20:
-        score += 5
-
-    if any(term in text_lower for term in DAMPENERS):
-        score -= 35
-
-    score = max(0, min(100, score))
-
-    if score >= 70:
-        label = "CRITICAL"
-    elif score >= 45:
-        label = "HIGH"
-    elif score >= 25:
-        label = "MEDIUM"
-    else:
-        label = "LOW"
-
-    return score, label
 
 
 # Maps how X writes chain names in "chain:0xaddress" references to the
@@ -641,25 +840,60 @@ def format_alert(tweet: dict, score: int, label: str, zh_text: str, summary: str
 
 def run_self_test():
     """
-    Sends one fake, clearly-labeled TEST alert through the full pipeline
-    (scoring, translation, Telegram formatting) so you can verify everything
-    is wired correctly without waiting for a real incident tweet.
+    Sends one clearly-labeled TEST alert through the full pipeline
+    (AI scoring, translation, Telegram formatting) so you can verify
+    everything is wired correctly, or check what score a specific real
+    tweet would get, without waiting for it to appear via X search.
     Triggered by setting SELF_TEST_ON_START=true.
+
+    By default, scores a built-in fake example. To test a real tweet
+    instead, also set:
+      TEST_TWEET_TEXT     = the tweet's full text (required)
+      TEST_TWEET_USERNAME = the author's handle, no @ (optional)
     """
     print("Running self-test: sending a sample alert through the full pipeline...")
-    fake_tweet = {
-        "id": "0000000000000000000",
-        "text": "TEST ALERT: This is a sample tweet simulating a wallet drained "
-                "in a DeFi exploit, used only to verify your bot setup.",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "metrics": {"like_count": 123, "retweet_count": 45},
-        "username": "test_account",
-        "name": "Self-Test",
-    }
-    score, label = score_risk(fake_tweet)
-    zh_text = translate_to_chinese(fake_tweet["text"])
+
+    custom_text = os.environ.get("TEST_TWEET_TEXT")
+    if custom_text:
+        test_tweet = {
+            "id": "0000000000000000000",
+            "text": custom_text,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metrics": {"like_count": 0, "retweet_count": 0},
+            "username": os.environ.get("TEST_TWEET_USERNAME", "unknown"),
+            "name": "",
+        }
+        print(f"Using custom TEST_TWEET_TEXT (author: @{test_tweet['username']})")
+    else:
+        test_tweet = {
+            "id": "0000000000000000000",
+            "text": "TEST ALERT: This is a sample tweet simulating a wallet drained "
+                    "in a DeFi exploit, used only to verify your bot setup.",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metrics": {"like_count": 123, "retweet_count": 45},
+            "username": "test_account",
+            "name": "Self-Test",
+        }
+
+    test_tweet["text"] = resolve_token_symbols(test_tweet["text"])
+
+    ai_result = classify_with_ai(test_tweet)
+    if not ai_result:
+        print("AI classification failed or is unreachable — scoring is AI-only now, "
+              "so no alert can be sent. Check XAI_API_KEY and the xAI API status.",
+              file=sys.stderr)
+        send_system_alert(
+            "Self-test: AI classification (Grok) failed. Scoring is AI-only — "
+            "check XAI_API_KEY / xAI status."
+        )
+        return
+
+    score, label, summary, reasoning, case_key = ai_result
+    print(f"Scored via AI: {label} {score}/100 — {reasoning} (case_key: {case_key})")
+
+    zh_text = translate_to_chinese(test_tweet["text"])
     message = "🧪 <b>SELF-TEST — not a real incident</b>\n\n" + format_alert(
-        fake_tweet, score, label, zh_text
+        test_tweet, score, label, zh_text, summary
     )
     send_telegram_alert(message)
     print("Self-test message sent. Check your Telegram chat now.")
@@ -675,6 +909,31 @@ def send_system_alert(message: str):
     send_telegram_alert(full_message)
 
 
+# Scoring is AI-only now — no keyword-based fallback. If Grok is
+# unreachable, tweets during that window are skipped (not silently
+# keyword-scored) and you're paged on Telegram instead, cooldown-guarded so
+# a stuck outage doesn't spam you once per tweet.
+_last_ai_failure_alert_at = None
+AI_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
+
+
+def note_ai_failure_and_maybe_alert():
+    global _last_ai_failure_alert_at
+    now = datetime.now(timezone.utc)
+    cooldown_elapsed = (
+        _last_ai_failure_alert_at is None
+        or (now - _last_ai_failure_alert_at).total_seconds() > AI_FAILURE_ALERT_COOLDOWN_SECONDS
+    )
+    if cooldown_elapsed:
+        send_system_alert(
+            "AI classification (Grok) is unreachable or failing. Scoring is "
+            "AI-only — tweets are being SKIPPED (not keyword-scored) until "
+            "this recovers, so you may be missing real incidents right now. "
+            "Check XAI_API_KEY / xAI status."
+        )
+        _last_ai_failure_alert_at = now
+
+
 def run_once(since_id):
     tweets, newest_id, error = search_recent_tweets(since_id)
     if tweets:
@@ -688,21 +947,21 @@ def run_once(since_id):
         # symbols before this text is used anywhere downstream.
         tweet["text"] = resolve_token_symbols(tweet["text"])
 
-        ai_result = classify_with_ai(tweet)
-        if ai_result:
-            score, label, summary, reasoning = ai_result
-            source = "AI"
-        else:
-            score, label = score_risk(tweet)  # fallback: keyword heuristic
-            summary, reasoning = "", ""
-            source = "keyword"
-
         preview = tweet["text"][:80].replace("\n", " ")
+
+        ai_result = classify_with_ai(tweet)
+        if not ai_result:
+            print(f"  [SKIPPED — AI unreachable] {likes} likes @{tweet['username']}: {preview}",
+                  file=sys.stderr)
+            note_ai_failure_and_maybe_alert()
+            continue
+
+        score, label, summary, reasoning, case_key = ai_result
 
         # Always log the score, even for tweets that won't alert — this is
         # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
         # MIN_ENGAGEMENT_FILTER against real traffic.
-        print(f"  [{label} {score}/100 via {source}] {likes} likes @{tweet['username']}: {preview}")
+        print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
         if reasoning:
             print(f"    reasoning: {reasoning}")
 
@@ -718,6 +977,8 @@ def run_once(since_id):
         send_telegram_alert(message)
         if summary:
             remember_alert(summary)  # so future duplicates of this get suppressed
+        if case_key and summary:
+            record_case_update(case_key, tweet, score, label, summary)
         print(f"    -> ALERT SENT")
         time.sleep(1)  # be gentle with Telegram's rate limits
 
@@ -728,7 +989,8 @@ def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] Crypto incident monitor starting up.")
     print(f"Polling every {POLL_INTERVAL_SECONDS}s. Alert threshold: {MIN_RISK_SCORE_TO_ALERT}. "
           f"Min engagement filter: {MIN_ENGAGEMENT_FILTER} likes.")
-    print(f"Search query: {build_query()}")
+    for i, q in enumerate(build_queries(), start=1):
+        print(f"Search query {i}: {q}")
 
     if not X_BEARER_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("ERROR: Missing one or more required env vars: X_BEARER_TOKEN, "
@@ -742,10 +1004,17 @@ def main():
     consecutive_failures = 0
     last_health_alert_at = None
     HEALTH_ALERT_COOLDOWN_SECONDS = 1800  # don't re-page more than once per 30 min
+    last_report_at = datetime.now(timezone.utc)  # first report waits one full interval
 
     while True:
         try:
             since_id, error = run_once(since_id)
+
+            if REPORT_INTERVAL_HOURS > 0 and XAI_API_KEY:
+                hours_since_report = (datetime.now(timezone.utc) - last_report_at).total_seconds() / 3600
+                if hours_since_report >= REPORT_INTERVAL_HOURS:
+                    send_periodic_case_report()
+                    last_report_at = datetime.now(timezone.utc)
 
             if error:
                 consecutive_failures += 1
