@@ -452,12 +452,13 @@ def classify_with_ai(tweet: dict):
         "value must be written as the two characters backslash-n (\\n), "
         "NEVER as an actual line break, or the JSON will fail to parse.\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
-        '"summary": "<Start with EXACTLY this format: '
-        "'Affected project/tokens: <name(s), or \\'Unknown\\' if not stated>.' "
-        "Then a \\\\n escape sequence, then 2-3 plain-English sentences "
-        "explaining what happened, in clear non-technical language a risk "
-        'officer can act on — what was exploited, how, and the scale of '
-        'loss if known>", '
+        '"summary": "<HARD LIMIT: 140 characters, no exceptions — this is '
+        "read on a phone alert, not a report. ONE compact sentence in the "
+        "shape '<Project/token name, or \\'Unknown\\'>: <what's happening>' "
+        "— e.g. 'Liquid Network: bridge contract actively being drained, "
+        "~$3M out so far.' Plain, non-technical language a risk officer "
+        "can act on instantly. Cut every word that isn't essential; drop "
+        'the loss figure/detail entirely rather than exceed 140 chars>", '
         '"reasoning": "<one short sentence on why this score, including '
         'your source-credibility judgment>"}\n\n'
         "Set is_real_incident TRUE for anything suggesting an incident is "
@@ -589,6 +590,10 @@ def classify_with_ai(tweet: dict):
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
         is_real = bool(parsed.get("is_real_incident", False))
         summary = parsed.get("summary", "").strip()
+        if len(summary) > 140:
+            # Safety net in case the AI overshoots the 140-char instruction —
+            # trim on a word boundary rather than mid-word.
+            summary = summary[:140].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
         reasoning = parsed.get("reasoning", "").strip()
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
