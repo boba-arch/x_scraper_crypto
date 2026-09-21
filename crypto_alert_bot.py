@@ -64,43 +64,6 @@ DEDUPE_MAX_ENTRIES = int(os.environ.get("DEDUPE_MAX_ENTRIES", "10"))  # cap memo
 # Resets on restart — same caveat as since_id.
 recent_alerts: list[dict] = []
 
-# --- Periodic case-report feature ---------------------------------------
-# How often (hours) to send a consolidated digest grouping updates by
-# incident ("case"). Set to 0 to disable this feature entirely.
-REPORT_INTERVAL_HOURS = float(os.environ.get("REPORT_INTERVAL_HOURS", "6"))
-# How long (hours) a case stays tracked/reportable after its last update,
-# before being dropped from memory to bound cost and message size.
-CASE_RETENTION_HOURS = float(os.environ.get("CASE_RETENTION_HOURS", "72"))
-
-# In-memory incident tracker: case_key -> {"first_seen", "last_seen",
-# "updates": [{"time", "summary", "score", "label", "username"}, ...]}.
-# Populated every time a real alert fires (see run_once). Resets on
-# restart — same caveat as since_id / recent_alerts.
-cases: dict[str, dict] = {}
-
-
-def record_case_update(case_key: str, tweet: dict, score: int, label: str, summary: str):
-    now = datetime.now(timezone.utc)
-    if case_key not in cases:
-        cases[case_key] = {"first_seen": now, "last_seen": now, "updates": []}
-    case = cases[case_key]
-    case["last_seen"] = now
-    case["updates"].append({
-        "time": now,
-        "summary": summary,
-        "score": score,
-        "label": label,
-        "username": tweet.get("username", "unknown"),
-    })
-
-
-def prune_stale_cases():
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=CASE_RETENTION_HOURS)
-    stale = [k for k, c in cases.items() if c["last_seen"] < cutoff]
-    for k in stale:
-        del cases[k]
-
-
 def remember_alert(summary: str):
     recent_alerts.append({"time": datetime.now(timezone.utc), "summary": summary})
     prune_recent_alerts()
@@ -190,88 +153,6 @@ def call_ai(system_prompt: str, user_message: str, max_tokens: int = 500):
 
     return None, None
 
-
-def generate_case_report_text(case_key: str, case: dict) -> str:
-    """
-    Asks Claude to synthesize one case's full update history into a single
-    current-status readout — explicitly answering the kind of questions a
-    risk officer wants (attacker caught? funds frozen/recovered? latest
-    status?) rather than just listing raw updates. Returns plain text, or
-    None if the call fails (caller should skip this case for this report
-    rather than fail the whole digest).
-    """
-    updates_text = "\n".join(
-        f"[{u['time'].strftime('%Y-%m-%d %H:%M UTC')}] (@{u['username']}, "
-        f"{u['label']} {u['score']}) {u['summary']}"
-        for u in case["updates"]
-    )
-    system_prompt = (
-        "You are a crypto security analyst writing a status update for a "
-        "risk officer at an exchange, synthesizing everything tracked so "
-        "far about ONE ongoing incident into a short current-status "
-        "readout. You'll be given a chronological list of updates about "
-        "this case.\n\n"
-        "Write 3-5 sentences covering, as far as the updates allow you to "
-        "determine: (1) what happened and to which project/protocol, (2) "
-        "the current status — is it still unfolding or has it stabilized, "
-        "(3) explicitly state whether the attacker has been identified or "
-        "caught (say 'not stated' if the updates don't say), (4) "
-        "explicitly state whether funds have been frozen or recovered "
-        "(say 'not stated' if unclear), (5) total financial impact if "
-        "known. Be direct and factual — don't pad with filler, and "
-        "explicitly say 'not stated' rather than guessing at anything the "
-        "updates don't actually cover. Plain text only, no JSON, no "
-        "markdown headers — just the readout itself."
-    )
-    text, provider = call_ai(system_prompt, updates_text, max_tokens=400)
-    if not text:
-        print(f"Case report generation failed for {case_key}: both Claude and "
-              f"Grok were unreachable/erroring.", file=sys.stderr)
-        return None
-    return text
-
-
-def send_periodic_case_report():
-    """
-    Builds and sends a Telegram digest with one consolidated status
-    readout per actively-tracked case. Skips sending entirely if there
-    are no cases to report (avoids empty noise messages).
-    """
-    prune_stale_cases()
-    if not cases:
-        print("Periodic report: no active cases to report, skipping.")
-        return
-
-    print(f"Generating periodic case report for {len(cases)} case(s)...")
-    sections = []
-    for case_key, case in sorted(cases.items(), key=lambda kv: kv[1]["last_seen"], reverse=True):
-        report_text = generate_case_report_text(case_key, case)
-        if not report_text:
-            continue
-        title = case_key.replace("_", " ").title()
-        sections.append(
-            f"📋 <b>{html.escape(title)}</b>\n"
-            f"<i>{len(case['updates'])} update(s), last seen "
-            f"{case['last_seen'].strftime('%Y-%m-%d %H:%M UTC')}</i>\n\n"
-            f"{html.escape(report_text)}"
-        )
-
-    if not sections:
-        return  # every case's report generation failed — nothing usable to send
-
-    header = f"🗞️ <b>PERIODIC CASE REPORT</b> — {len(sections)} active case(s)\n\n"
-    body = header + "\n\n————————\n\n".join(sections)
-
-    # Telegram caps messages at 4096 chars — split into multiple messages
-    # rather than truncating and silently losing content.
-    TELEGRAM_LIMIT = 4000  # small safety margin below the actual 4096 cap
-    if len(body) <= TELEGRAM_LIMIT:
-        send_telegram_alert(body)
-    else:
-        send_telegram_alert(header + "(report split across multiple messages)")
-        for section in sections:
-            send_telegram_alert(section)
-            time.sleep(1)
 
 # Common false-positive phrases that share words with our incident terms
 # but are almost never real crypto security incidents (growth hacking,
@@ -519,10 +400,10 @@ def classify_with_ai(tweet: dict):
     Asks the AI (Claude primary, Grok fallback — see call_ai()) to judge
     whether a tweet describes a real, currently-active crypto security
     incident and assign a risk score. Returns
-    (score, label, summary, reasoning, case_key), or None if AI scoring
-    isn't configured or every provider's call fails. There is no
-    keyword-based fallback — scoring is AI-only, so callers should skip the
-    tweet and page on Telegram when this returns None (see
+    (score, label, summary, reasoning), or None if AI scoring isn't
+    configured or every provider's call fails. There is no keyword-based
+    fallback — scoring is AI-only, so callers should skip the tweet and
+    page on Telegram when this returns None (see
     note_ai_failure_and_maybe_alert()).
     """
     if not ANTHROPIC_API_KEY and not XAI_API_KEY:
@@ -557,15 +438,6 @@ def classify_with_ai(tweet: dict):
         "value must be written as the two characters backslash-n (\\n), "
         "NEVER as an actual line break, or the JSON will fail to parse.\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
-        '"case_key": "<a short, STABLE identifier for this incident, '
-        "lowercase, words separated by underscores, based on the "
-        "project/protocol name + incident type, e.g. 'liquid_network_"
-        "exploit', 'vyfi_safeswaps_exploit'. Use the SAME key you would "
-        "use for any other tweet about this same incident, regardless of "
-        "who's tweeting or how they phrase it — this is used to group "
-        "updates about the same case together. If truly no project/"
-        "protocol name is identifiable, use 'unknown_' plus a few words "
-        'describing the incident type.>", '
         '"summary": "<Start with EXACTLY this format: '
         "'Affected project/tokens: <name(s), or \\'Unknown\\' if not stated>.' "
         "Then a \\\\n escape sequence, then 2-3 plain-English sentences "
@@ -694,7 +566,6 @@ def classify_with_ai(tweet: dict):
         is_real = bool(parsed.get("is_real_incident", False))
         summary = parsed.get("summary", "").strip()
         reasoning = parsed.get("reasoning", "").strip()
-        case_key = parsed.get("case_key", "").strip().lower() or "unknown_incident"
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
 
@@ -706,7 +577,7 @@ def classify_with_ai(tweet: dict):
             label = "MEDIUM"
         else:
             label = "LOW"
-        return score, label, summary, reasoning, case_key
+        return score, label, summary, reasoning
 
     except Exception as e:
         print(f"AI response from {provider} couldn't be parsed: {e}\n"
@@ -934,8 +805,8 @@ def run_self_test():
         )
         return
 
-    score, label, summary, reasoning, case_key = ai_result
-    print(f"Scored via AI: {label} {score}/100 — {reasoning} (case_key: {case_key})")
+    score, label, summary, reasoning = ai_result
+    print(f"Scored via AI: {label} {score}/100 — {reasoning}")
 
     zh_text = translate_to_chinese(test_tweet["text"])
     message = "🧪 <b>SELF-TEST — not a real incident</b>\n\n" + format_alert(
@@ -1004,7 +875,7 @@ def run_once(since_id):
             note_ai_failure_and_maybe_alert()
             continue
 
-        score, label, summary, reasoning, case_key = ai_result
+        score, label, summary, reasoning = ai_result
 
         # Always log the score, even for tweets that won't alert — this is
         # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
@@ -1025,8 +896,6 @@ def run_once(since_id):
         send_telegram_alert(message)
         if summary:
             remember_alert(summary)  # so future duplicates of this get suppressed
-        if case_key and summary:
-            record_case_update(case_key, tweet, score, label, summary)
         print(f"    -> ALERT SENT")
         time.sleep(1)  # be gentle with Telegram's rate limits
 
@@ -1065,17 +934,10 @@ def main():
     consecutive_failures = 0
     last_health_alert_at = None
     HEALTH_ALERT_COOLDOWN_SECONDS = 1800  # don't re-page more than once per 30 min
-    last_report_at = datetime.now(timezone.utc)  # first report waits one full interval
 
     while True:
         try:
             since_id, error = run_once(since_id)
-
-            if REPORT_INTERVAL_HOURS > 0 and (ANTHROPIC_API_KEY or XAI_API_KEY):
-                hours_since_report = (datetime.now(timezone.utc) - last_report_at).total_seconds() / 3600
-                if hours_since_report >= REPORT_INTERVAL_HOURS:
-                    send_periodic_case_report()
-                    last_report_at = datetime.now(timezone.utc)
 
             if error:
                 consecutive_failures += 1
