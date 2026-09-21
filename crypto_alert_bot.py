@@ -224,7 +224,7 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 INCIDENT_TERMS_A = [
     "exploit", "hacked", "breach", "drained", "compromised",
     "rugpull", "reentrancy", "private key leaked", "wallet drained",
-    "bridge exploit", "attack", "attacked",
+    "bridge exploit",
     # Post-hack fund movement / threat-actor tracking — distinct from an
     # active fresh exploit, but valuable for spotting stolen funds heading
     # toward an exchange. See the AI prompt's scoring guidance for how
@@ -232,8 +232,8 @@ INCIDENT_TERMS_A = [
     "laundering", "launder", "lazarus",
     # Broader attack-vector and disclosure vocabulary — added once AI
     # scoring was trusted to filter the resulting noise.
-    "unauthorized", "flash loan",
-    "oracle manipulation", "stolen",
+    "access control", "unauthorized", "flash loan",
+    "oracle manipulation", "stolen", "phishing",
 ]
 
 # Context (crypto-relevance) terms ANDed against INCIDENT_TERMS_A.
@@ -259,7 +259,14 @@ INCIDENT_TERMS_B = [
 CONTEXT_B = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
     "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
-    "eth", "btc", "blockchain", "mainnet", "network", "validators",
+    "eth", "btc", "blockchain", "mainnet",
+    # NOTE: standalone "network"/"validators" were removed from here — they
+    # made this query match non-crypto outage tweets (e.g. an ISP's own
+    # network disruption notice) whenever they also contained "under
+    # investigation" or similar. INCIDENT_TERMS_B already has "network
+    # paused" and "validators paused" as their own specific phrase terms,
+    # so that coverage isn't lost — this just drops the overly generic
+    # standalone versions.
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
@@ -475,6 +482,22 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         "active exploit than wait for a confirmed post-mortem — by the time "
         "a project publishes a full writeup, the window to protect the "
         "exchange has usually already closed.\n\n"
+        "CRYPTO RELEVANCE GATE — before anything else, confirm this tweet "
+        "is actually ABOUT a cryptocurrency/blockchain/DeFi/Web3 entity: a "
+        "token, protocol, smart contract, exchange, wallet, chain, bridge, "
+        "or similar. The search that surfaced this tweet is keyword-based "
+        "and NOT restricted to crypto accounts, so it will also surface "
+        "unrelated organizations — ISPs, telecoms, banks, SaaS companies, "
+        "government agencies, etc. — that happen to use similar words "
+        "('outage', 'under investigation', 'service disrupted', 'paused', "
+        "'breach'). If the account/incident is NOT plausibly "
+        "crypto/blockchain-related (e.g. an internet/telecom provider's "
+        "network outage, an unrelated company's data breach), set "
+        "is_real_incident FALSE and score LOW (0-10) — this applies "
+        "EVEN IF the wording otherwise matches a pattern described below, "
+        "including the official first-party operational disclosure special "
+        "case. A crypto-sounding project/token name is a good signal but "
+        "not required — judge from the actual subject matter.\n\n"
         "This search is NOT restricted to pre-vetted accounts — you will "
         "see tweets from anyone, including random or unverified accounts "
         "making claims. Judge source credibility, but do NOT require "
@@ -510,6 +533,20 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         '"reasoning": "<one short sentence on why this score, including '
         'your source-credibility AND recency judgment>"}\n\n'
         f"{recency_instructions}\n\n"
+        "GATE — crypto/blockchain relevance FIRST, before anything else: "
+        "this tweet reached you via a keyword search, not a crypto-only "
+        "feed, so some tweets will use incident-sounding words ('attack', "
+        "'breach', 'under investigation', 'network disruption', 'outage') "
+        "about something that has NOTHING to do with crypto — an ISP, a "
+        "telecom network, a corporate IT system, a game server, a physical "
+        "or political attack, etc. Before applying any rule below, first "
+        "confirm this is actually about a crypto/blockchain entity — a "
+        "coin, token, protocol, exchange, wallet, smart contract, or "
+        "on-chain activity. If it is NOT, set is_real_incident FALSE and "
+        "risk_score below 10, regardless of how closely the wording "
+        "resembles a real incident disclosure — a company's own network/"
+        "internet outage is not a crypto security incident just because it "
+        "says 'network' and 'under investigation'.\n\n"
         "Set is_real_incident TRUE for anything suggesting an incident is "
         "NEW or CURRENTLY UNFOLDING — active draining, an exploit in "
         "progress, abnormal/excessive token minting, funds actively moving "
@@ -550,8 +587,11 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         "is_real_incident FALSE and score LOW (10-20) — regardless of how "
         "detailed or alarming the incident recap itself is, and even if "
         "you haven't seen this specific incident mentioned before.\n\n"
-        "SPECIAL CASE — official first-party operational disclosure: some "
-        "tweets are an official project/platform account announcing that "
+        "SPECIAL CASE — official first-party operational disclosure "
+        "(CRYPTO ONLY — see the GATE above; this does NOT apply to an "
+        "ISP, telecom, hosting provider, or any other non-crypto service "
+        "outage, even one phrased identically): some tweets are an "
+        "official crypto project/platform account announcing that "
         "operations are disrupted by a halt, pause, or security "
         "investigation. This covers TWO situations, treated the same way: "
         "(a) the account's OWN network/protocol has halted, paused "
