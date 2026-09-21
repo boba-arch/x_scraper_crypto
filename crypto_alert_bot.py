@@ -138,144 +138,54 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-def call_ai(system_prompt: str, user_message: str, max_tokens: int = 500):
+
+def _call_grok_responses_with_search(system_prompt: str, user_message: str, max_tokens: int) -> str:
     """
-    Calls the configured AI provider(s) with automatic failover: tries
-    Claude first (primary) if ANTHROPIC_API_KEY is set, and only falls back
-    to Grok if Claude errors or isn't configured. Returns (text,
-    provider_name) on success, or (None, None) if every configured
-    provider failed. There is no keyword-based fallback — callers should
-    treat (None, None) as "AI unreachable": skip the tweet/case and page on
-    Telegram (see note_ai_failure_and_maybe_alert()).
+    Calls xAI's /v1/responses endpoint with the x_search tool enabled —
+    Grok's LIVE X search, real-time access to X that Claude does not have.
+    Raises on any failure (caller handles fallback). Note: this endpoint
+    bills x_search usage per post/profile fetched, separate from and in
+    addition to normal chat tokens.
     """
-    if ANTHROPIC_API_KEY:
-        try:
-            return _call_claude(system_prompt, user_message, max_tokens), "claude"
-        except Exception as e:
-            print(f"Claude API call failed, trying Grok fallback: {e}", file=sys.stderr)
-
-    if XAI_API_KEY:
-        try:
-            return _call_grok(system_prompt, user_message, max_tokens), "grok"
-        except Exception as e:
-            print(f"Grok API call failed: {e}", file=sys.stderr)
-
-    return None, None
-
-
-def verify_incident_recency_with_live_search(tweet: dict, summary: str):
-    """
-    Uses Grok's LIVE X search (xAI's /v1/responses endpoint + the x_search
-    tool — real-time access to X, which Claude does not have) to double-
-    check a tweet BEFORE it's alerted on: is this incident genuinely new/
-    just happening, or has it already been circulating (e.g. reported
-    yesterday) and this tweet is just a late/re-surfaced mention?
-
-    This is a deliberate second opinion, separate from classify_with_ai()'s
-    scoring — that call has no real-time awareness and can be fooled by a
-    tweet that reads as "breaking" but is actually old news. This is also
-    why it's only run on tweets that already passed scoring/thresholds
-    (see run_once()): x_search bills per post/profile fetched, so running
-    it on every candidate tweet would be wasteful — it only needs to run on
-    tweets that are about to trigger a real alert.
-
-    Returns a dict {"is_new_and_active": bool, "first_seen_estimate": str,
-    "note": str} on success, or None if the check couldn't be completed
-    (unreachable, not configured, bad response, etc). Callers should FAIL
-    OPEN on None — i.e. still send the alert — since missing a real
-    incident is worse than occasionally not catching a stale repost.
-    """
-    if not LIVE_SEARCH_RECENCY_CHECK or not XAI_API_KEY:
-        return None
-
-    system_prompt = (
-        "You are verifying whether a crypto security incident is CURRENTLY "
-        "new/breaking or already old news, using live X search. Search X "
-        "for other posts about this same incident/project to find the "
-        "EARLIEST credible mention you can. Compare that to right now.\n\n"
-        "Respond with ONLY a JSON object, no other text, no markdown "
-        "fences: {\"is_new_and_active\": true or false, "
-        "\"first_seen_estimate\": \"<your best estimate of when this "
-        "incident first appeared on X, e.g. 'within the last hour', "
-        "'~18 hours ago', 'yesterday', '2+ days ago', or 'unknown' if you "
-        "can't find earlier mentions>\", \"note\": \"<one short sentence, "
-        "under 140 characters, on what you found>\"}\n\n"
-        "Set is_new_and_active to TRUE if the earliest mentions you can "
-        "find are recent (roughly within the last few hours) OR if you "
-        "can't find any earlier mentions at all (in which case this tweet "
-        "may itself be the earliest signal — treat that as new/active, not "
-        "stale). Set it FALSE only if you find clear evidence this same "
-        "incident was already being reported significantly earlier (e.g. "
-        "yesterday or before) with no sign it's still actively unfolding."
+    resp = requests.post(
+        "https://api.x.ai/v1/responses",
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROK_LIVE_SEARCH_MODEL,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "tools": [{"type": "x_search"}],
+            "max_output_tokens": max_tokens,
+        },
+        timeout=30,
     )
-    user_message = (
-        f"Tweet to verify (by @{tweet.get('username', 'unknown')}): "
-        f"{tweet['text']}\n\nOur system's summary of it: {summary}"
-    )
+    resp.raise_for_status()
+    data = resp.json()
 
-    try:
-        resp = requests.post(
-            "https://api.x.ai/v1/responses",
-            headers={
-                "Authorization": f"Bearer {XAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROK_LIVE_SEARCH_MODEL,
-                "input": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                "tools": [{"type": "x_search"}],
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # The /v1/responses "output" array can contain more than just the
-        # final message — when tools are used (like x_search here), earlier
-        # items are often tool-call/reasoning entries with no "content"
-        # field, so output[0] isn't reliably the message. Scan for the
-        # first item that actually has text content instead of assuming
-        # a fixed position.
-        text = None
-        for item in data.get("output", []):
-            for block in item.get("content", []) or []:
-                if isinstance(block, dict) and block.get("text"):
-                    text = block["text"]
-                    break
-            if text:
+    # The /v1/responses "output" array can contain more than just the
+    # final message — when tools are used (like x_search here), earlier
+    # items are often tool-call/reasoning entries with no "content" field,
+    # so output[0] isn't reliably the message. Scan for the first item
+    # that actually has text content instead of assuming a fixed position.
+    text = None
+    for item in data.get("output", []):
+        for block in item.get("content", []) or []:
+            if isinstance(block, dict) and block.get("text"):
+                text = block["text"]
                 break
-        if not text:
-            # Fallback for APIs that also expose a flat convenience field.
-            text = data.get("output_text")
-        if not text:
-            raise ValueError(f"No text content found in response: {data!r}")
-
-        text = text.strip()
-        text = text.replace("```json", "").replace("```", "").strip()
-
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            repaired = re.sub(
-                r'"((?:[^"\\]|\\.)*)"',
-                lambda m: '"' + m.group(1).replace("\n", "\\n") + '"',
-                text,
-                flags=re.DOTALL,
-            )
-            parsed = json.loads(repaired)
-
-        return {
-            "is_new_and_active": bool(parsed.get("is_new_and_active", True)),
-            "first_seen_estimate": parsed.get("first_seen_estimate", "unknown").strip(),
-            "note": parsed.get("note", "").strip(),
-        }
-    except Exception as e:
-        print(f"Live-search recency check failed (proceeding with alert "
-              f"anyway — failing open): {e}", file=sys.stderr)
-        return None
+        if text:
+            break
+    if not text:
+        # Fallback for APIs that also expose a flat convenience field.
+        text = data.get("output_text")
+    if not text:
+        raise ValueError(f"No text content found in response: {data!r}")
+    return text.strip()
 
 
 # Common false-positive phrases that share words with our incident terms
@@ -519,25 +429,38 @@ def search_recent_tweets(since_id: str | None):
     return list(combined_by_id.values()), newest_id, error_message
 
 
-def classify_with_ai(tweet: dict):
-    """
-    Asks the AI (Claude primary, Grok fallback — see call_ai()) to judge
-    whether a tweet describes a real, currently-active crypto security
-    incident and assign a risk score. Returns
-    (score, label, summary, reasoning), or None if AI scoring isn't
-    configured or every provider's call fails. There is no keyword-based
-    fallback — scoring is AI-only, so callers should skip the tweet and
-    page on Telegram when this returns None (see
-    note_ai_failure_and_maybe_alert()).
-    """
-    if not ANTHROPIC_API_KEY and not XAI_API_KEY:
-        return None
+def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> str:
+    if has_live_search:
+        recency_instructions = (
+            "RECENCY VIA LIVE SEARCH — you have LIVE X SEARCH available for "
+            "this call. Use it to find the EARLIEST credible mention you "
+            "can of this same incident/project being exploited, and "
+            "compare that to right now. Fold this DIRECTLY into "
+            "risk_score, on top of everything else below: an incident you "
+            "confirm started within roughly the last few hours (or one "
+            "where you can't find any earlier mention at all — meaning "
+            "this tweet may itself be the earliest signal) should score "
+            "toward the HIGH end of whatever band it otherwise falls in. "
+            "An incident you find was ALREADY being reported significantly "
+            "earlier (yesterday or before), with no sign it's still "
+            "actively unfolding, should be scored LOW — toward 0-24 — "
+            "regardless of how severe it sounds, because it's stale and "
+            "the exchange's window for a first response has likely already "
+            "passed. Put your best estimate in first_seen_estimate, e.g. "
+            "'within the last hour', '~18 hours ago', 'yesterday', "
+            "'2+ days ago', or 'no earlier mention found'."
+        )
+    else:
+        recency_instructions = (
+            "RECENCY — you do NOT have live search access for this call, "
+            "so you cannot verify how long ago this incident actually "
+            "started; reason only from the tweet's own wording and "
+            "whatever timing cues it contains. Do not claim to have "
+            "checked X for earlier mentions. Set first_seen_estimate to "
+            "'not verified (no live search)'."
+        )
 
-    username = tweet.get("username", "unknown")
-    is_known_trusted = username.lower() in TRUSTED_ACCOUNTS
-    trusted_list = ", ".join(sorted(TRUSTED_ACCOUNTS))
-
-    system_prompt = (
+    return (
         "You are risk management staff at a crypto exchange. Your job is to "
         "monitor X/Twitter around the clock for a NEW, CURRENTLY-HAPPENING "
         "security incident (a protocol being actively drained, a token "
@@ -576,6 +499,7 @@ def classify_with_ai(tweet: dict):
         "value must be written as the two characters backslash-n (\\n), "
         "NEVER as an actual line break, or the JSON will fail to parse.\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
+        '"first_seen_estimate": "<see RECENCY instructions below>", '
         '"summary": "<HARD LIMIT: 140 characters, no exceptions — this is '
         "read on a phone alert, not a report. ONE compact sentence in the "
         "shape '<Project/token name, or \\'Unknown\\'>: <what's happening>' "
@@ -584,7 +508,8 @@ def classify_with_ai(tweet: dict):
         "can act on instantly. Cut every word that isn't essential; drop "
         'the loss figure/detail entirely rather than exceed 140 chars>", '
         '"reasoning": "<one short sentence on why this score, including '
-        'your source-credibility judgment>"}\n\n'
+        'your source-credibility AND recency judgment>"}\n\n'
+        f"{recency_instructions}\n\n"
         "Set is_real_incident TRUE for anything suggesting an incident is "
         "NEW or CURRENTLY UNFOLDING — active draining, an exploit in "
         "progress, abnormal/excessive token minting, funds actively moving "
@@ -653,21 +578,26 @@ def classify_with_ai(tweet: dict):
         "unverified rando making claims — an official channel disclosing "
         "impact to its own users is itself the actionable signal, so don't "
         "undersell it while waiting for more details.\n\n"
-        "Scoring guide — weight CURRENT/ACTIVE status above all else; "
-        "source credibility adjusts within that, it doesn't override it: "
-        "0-24 = no real incident signal, pure speculation/noise, or a "
-        "POST-MORTEM/update about an incident that's already stabilized "
-        "with nothing new actionable. 25-44 = plausible but light on "
-        "detail — a brief/early live-sounding report from an unverified "
-        "source, or routine threat-actor fund movement with no exchange "
-        "destination stated. 45-69 = credible and actively unfolding right "
-        "now (draining, exploit in progress, abnormal minting), even if "
-        "details are still thin — this band is where most fresh incident "
-        "chatter should land. 70-100 = confirmed MAJOR incident that is "
-        "currently active, from a credible source or with strong "
-        "supporting evidence, or an official first-party disclosure of "
-        "disrupted operations — large funds at risk/lost, attacker still "
-        "moving funds, or critical infrastructure compromised.\n\n"
+        "Scoring guide — weight CURRENT/ACTIVE status above all else, with "
+        "RECENCY (per the instructions above) as the strongest single "
+        "modifier within a band; source credibility adjusts within that, "
+        "it doesn't override either: 0-24 = no real incident signal, pure "
+        "speculation/noise, a POST-MORTEM/update about an incident that's "
+        "already stabilized with nothing new actionable, OR any incident "
+        "your live search confirms was already stale/old news. 25-44 = "
+        "plausible but light on detail — a brief/early live-sounding "
+        "report from an unverified source, or routine threat-actor fund "
+        "movement with no exchange destination stated. 45-69 = credible "
+        "and actively unfolding right now (draining, exploit in progress, "
+        "abnormal minting), even if details are still thin — this band is "
+        "where most fresh incident chatter should land, and within it, "
+        "push toward 69 the more recent your live search confirms it to "
+        "be. 70-100 = confirmed MAJOR incident that is currently active — "
+        "confirmed fresh (within the last few hours, or no earlier mention "
+        "found) by a credible source or with strong supporting evidence, "
+        "or an official first-party disclosure of disrupted operations — "
+        "large funds at risk/lost, attacker still moving funds, or "
+        "critical infrastructure compromised.\n\n"
         "DUPLICATE CHECK — incidents already alerted on recently (within "
         f"the last {DEDUPE_WINDOW_HOURS:.0f}h):\n{recent_alerts_context()}\n\n"
         "If this tweet is reporting the SAME underlying incident as one "
@@ -681,18 +611,14 @@ def classify_with_ai(tweet: dict):
         "is_real_incident TRUE and note in the summary what's new."
     )
 
-    verified_note = "verified" if tweet.get("verified") else "not verified"
-    user_message = (
-        f"Tweet author: @{username} ({verified_note} account)\n"
-        f"Tweet text: {tweet['text']}"
-    )
 
-    text, provider = call_ai(system_prompt, user_message, max_tokens=500)
-    if not text:
-        print("AI classification failed: both Claude and Grok were "
-              "unreachable/erroring.", file=sys.stderr)
-        return None
-
+def _parse_classification_json(text: str, provider: str):
+    """
+    Shared JSON parsing/repair for classify_with_ai()'s response, used by
+    every provider attempt. Returns (score, label, summary, reasoning,
+    first_seen) on success, or None if the response couldn't be parsed
+    into a usable classification.
+    """
     try:
         text = text.replace("```json", "").replace("```", "").strip()
 
@@ -719,6 +645,7 @@ def classify_with_ai(tweet: dict):
             # trim on a word boundary rather than mid-word.
             summary = summary[:140].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
         reasoning = parsed.get("reasoning", "").strip()
+        first_seen = parsed.get("first_seen_estimate", "unknown").strip()
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
 
@@ -730,12 +657,89 @@ def classify_with_ai(tweet: dict):
             label = "MEDIUM"
         else:
             label = "LOW"
-        return score, label, summary, reasoning
+        return score, label, summary, reasoning, first_seen
 
     except Exception as e:
         print(f"AI response from {provider} couldn't be parsed: {e}\n"
               f"  Raw response was: {text!r}", file=sys.stderr)
         return None
+
+
+def classify_with_ai(tweet: dict):
+    """
+    Asks the AI to judge whether a tweet describes a real, currently-active
+    crypto security incident, assign a risk score, and — when using Grok
+    with live X search — verify how recently the incident actually started,
+    folding that directly into the score (fresher = higher, stale = lower).
+    This replaces the old two-step design (a separate scoring call, then a
+    separate pre-alert live-search recency check): now the SAME AI call
+    does both, as requested.
+
+    Provider priority (first that succeeds wins):
+      1. Grok WITH live X search — best: classification + real recency
+         verification in one call. Used when XAI_API_KEY is set and
+         LIVE_SEARCH_RECENCY_CHECK is enabled (the default).
+      2. Claude — classification only, no live search (can't verify
+         recency, so it's told to not claim to).
+      3. Grok WITHOUT live search — last resort if the live-search call
+         itself failed (e.g. bad response shape) but the key is still
+         presumably valid for plain chat completions.
+
+    Returns (score, label, summary, reasoning, first_seen_estimate), or
+    None if AI scoring isn't configured or every provider's call fails.
+    There is no keyword-based fallback — scoring is AI-only, so callers
+    should skip the tweet and page on Telegram when this returns None (see
+    note_ai_failure_and_maybe_alert()).
+    """
+    if not ANTHROPIC_API_KEY and not XAI_API_KEY:
+        return None
+
+    username = tweet.get("username", "unknown")
+    trusted_list = ", ".join(sorted(TRUSTED_ACCOUNTS))
+    verified_note = "verified" if tweet.get("verified") else "not verified"
+    user_message = (
+        f"Tweet author: @{username} ({verified_note} account)\n"
+        f"Tweet text: {tweet['text']}"
+    )
+
+    # 1. Grok + live X search (best — merged classification + recency).
+    if XAI_API_KEY and LIVE_SEARCH_RECENCY_CHECK:
+        system_prompt = _build_classification_prompt(trusted_list, has_live_search=True)
+        try:
+            text = _call_grok_responses_with_search(system_prompt, user_message, max_tokens=600)
+            result = _parse_classification_json(text, "grok (live search)")
+            if result:
+                return result
+        except Exception as e:
+            print(f"Grok live-search classification failed, trying next "
+                  f"provider: {e}", file=sys.stderr)
+
+    # 2. Claude — classification only, no live search.
+    if ANTHROPIC_API_KEY:
+        system_prompt = _build_classification_prompt(trusted_list, has_live_search=False)
+        try:
+            text = _call_claude(system_prompt, user_message, max_tokens=500)
+            result = _parse_classification_json(text, "claude")
+            if result:
+                return result
+        except Exception as e:
+            print(f"Claude classification failed, trying next provider: {e}",
+                  file=sys.stderr)
+
+    # 3. Grok without live search — last resort.
+    if XAI_API_KEY:
+        system_prompt = _build_classification_prompt(trusted_list, has_live_search=False)
+        try:
+            text = _call_grok(system_prompt, user_message, max_tokens=500)
+            result = _parse_classification_json(text, "grok (no search)")
+            if result:
+                return result
+        except Exception as e:
+            print(f"Grok (no search) classification failed: {e}", file=sys.stderr)
+
+    print("AI classification failed: every configured provider was "
+          "unreachable/erroring.", file=sys.stderr)
+    return None
 
 
 # Maps how X writes chain names in "chain:0xaddress" references to the
@@ -958,8 +962,8 @@ def run_self_test():
         )
         return
 
-    score, label, summary, reasoning = ai_result
-    print(f"Scored via AI: {label} {score}/100 — {reasoning}")
+    score, label, summary, reasoning, first_seen = ai_result
+    print(f"Scored via AI: {label} {score}/100 — {reasoning} (first seen: {first_seen})")
 
     zh_text = translate_to_chinese(test_tweet["text"])
     message = "🧪 <b>SELF-TEST — not a real incident</b>\n\n" + format_alert(
@@ -980,10 +984,11 @@ def send_system_alert(message: str):
 
 
 # Scoring is AI-only — no keyword-based fallback. classify_with_ai()
-# already tries Claude, then Grok, before giving up (see call_ai()); this
-# only fires once BOTH have failed. Tweets during that window are skipped
-# (not silently keyword-scored) and you're paged on Telegram instead,
-# cooldown-guarded so a stuck outage doesn't spam you once per tweet.
+# already tries every configured provider in priority order before giving
+# up; this only fires once ALL of them have failed. Tweets during that
+# window are skipped (not silently keyword-scored) and you're paged on
+# Telegram instead, cooldown-guarded so a stuck outage doesn't spam you
+# once per tweet.
 _last_ai_failure_alert_at = None
 AI_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
 
@@ -1028,7 +1033,7 @@ def run_once(since_id):
             note_ai_failure_and_maybe_alert()
             continue
 
-        score, label, summary, reasoning = ai_result
+        score, label, summary, reasoning, first_seen = ai_result
 
         # Always log the score, even for tweets that won't alert — this is
         # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
@@ -1036,6 +1041,7 @@ def run_once(since_id):
         print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
         if reasoning:
             print(f"    reasoning: {reasoning}")
+        print(f"    first seen: {first_seen}")
 
         if likes < MIN_ENGAGEMENT_FILTER:
             print(f"    -> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
@@ -1043,21 +1049,6 @@ def run_once(since_id):
         if score < MIN_RISK_SCORE_TO_ALERT:
             print(f"    -> skipped (below MIN_RISK_SCORE_TO_ALERT={MIN_RISK_SCORE_TO_ALERT})")
             continue
-
-        # About to alert — do a live X-search recency check via Grok first
-        # (only Grok has real-time X access, not Claude) to catch cases
-        # where the tweet reads as breaking news but the incident actually
-        # started earlier (e.g. reported yesterday). Fails open: if the
-        # check errors or isn't configured, we still send the alert.
-        recency = verify_incident_recency_with_live_search(tweet, summary)
-        if recency:
-            print(f"    live-search recency check: "
-                  f"{'NEW/ACTIVE' if recency['is_new_and_active'] else 'STALE'} "
-                  f"(first seen: {recency['first_seen_estimate']}) — {recency['note']}")
-            if not recency["is_new_and_active"]:
-                print(f"    -> skipped (live search found this incident was "
-                      f"already circulating: {recency['first_seen_estimate']})")
-                continue
 
         zh_text = translate_to_chinese(tweet["text"])
         message = format_alert(tweet, score, label, zh_text, summary)
@@ -1088,23 +1079,27 @@ def main():
               "without at least one of these configured.", file=sys.stderr)
         sys.exit(1)
 
-    print(
-        "AI provider(s): "
-        + (f"Claude ({CLAUDE_MODEL}) primary" if ANTHROPIC_API_KEY else "Claude NOT configured")
-        + ", "
-        + (f"Grok ({GROK_MODEL}) fallback" if XAI_API_KEY else "Grok NOT configured")
-    )
     if LIVE_SEARCH_RECENCY_CHECK and XAI_API_KEY:
-        print(f"Live-search recency check: ON — Grok ({GROK_LIVE_SEARCH_MODEL}) "
-              f"will verify each alert-worthy tweet against real-time X search "
-              f"before it's sent, to catch stale/old incidents being reported "
-              f"late. This adds cost per alert-worthy tweet (x_search is "
-              f"billed per post/profile fetched, separate from chat tokens) "
-              f"and a few seconds of latency. Set LIVE_SEARCH_RECENCY_CHECK="
-              f"false to disable.")
+        print(f"AI provider priority: 1) Grok ({GROK_LIVE_SEARCH_MODEL}) WITH live X "
+              f"search — classifies AND verifies recency in one call, folding "
+              f"how fresh the incident is directly into the risk score; "
+              + (f"2) Claude ({CLAUDE_MODEL}) as fallback (no live search); "
+                 if ANTHROPIC_API_KEY else "2) Claude NOT configured; ")
+              + f"3) Grok without search as last resort. Live search bills "
+              f"per post/profile fetched, separate from chat tokens, and "
+              f"only runs on candidate tweets your two search queries "
+              f"already pulled — not every tweet on X. Set "
+              f"LIVE_SEARCH_RECENCY_CHECK=false to disable it and always "
+              f"use plain classification instead.")
     else:
-        print("Live-search recency check: OFF"
-              + (" (needs XAI_API_KEY)" if not XAI_API_KEY else ""))
+        print(
+            "AI provider priority: "
+            + (f"1) Claude ({CLAUDE_MODEL}); " if ANTHROPIC_API_KEY else "Claude NOT configured; ")
+            + (f"2) Grok ({GROK_MODEL}), no live search."
+               if XAI_API_KEY else "Grok NOT configured.")
+            + (" Live-search recency check is OFF." if not XAI_API_KEY
+               else " Live-search recency check is disabled (LIVE_SEARCH_RECENCY_CHECK=false).")
+        )
 
     if os.environ.get("SELF_TEST_ON_START", "false").lower() == "true":
         run_self_test()
