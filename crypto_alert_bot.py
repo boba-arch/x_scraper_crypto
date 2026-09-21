@@ -224,7 +224,7 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 INCIDENT_TERMS_A = [
     "exploit", "hacked", "breach", "drained", "compromised",
     "rugpull", "reentrancy", "private key leaked", "wallet drained",
-    "bridge exploit",
+    "bridge exploit", "attack", "attacked",
     # Post-hack fund movement / threat-actor tracking — distinct from an
     # active fresh exploit, but valuable for spotting stolen funds heading
     # toward an exchange. See the AI prompt's scoring guidance for how
@@ -232,8 +232,8 @@ INCIDENT_TERMS_A = [
     "laundering", "launder", "lazarus",
     # Broader attack-vector and disclosure vocabulary — added once AI
     # scoring was trusted to filter the resulting noise.
-    "access control", "unauthorized", "flash loan",
-    "oracle manipulation", "stolen", "phishing",
+    "unauthorized", "flash loan",
+    "oracle manipulation", "stolen",
 ]
 
 # Context (crypto-relevance) terms ANDed against INCIDENT_TERMS_A.
