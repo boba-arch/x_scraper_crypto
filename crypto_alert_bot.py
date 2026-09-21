@@ -232,7 +232,28 @@ def verify_incident_recency_with_live_search(tweet: dict, summary: str):
         )
         resp.raise_for_status()
         data = resp.json()
-        text = data["output"][0]["content"][0]["text"].strip()
+
+        # The /v1/responses "output" array can contain more than just the
+        # final message — when tools are used (like x_search here), earlier
+        # items are often tool-call/reasoning entries with no "content"
+        # field, so output[0] isn't reliably the message. Scan for the
+        # first item that actually has text content instead of assuming
+        # a fixed position.
+        text = None
+        for item in data.get("output", []):
+            for block in item.get("content", []) or []:
+                if isinstance(block, dict) and block.get("text"):
+                    text = block["text"]
+                    break
+            if text:
+                break
+        if not text:
+            # Fallback for APIs that also expose a flat convenience field.
+            text = data.get("output_text")
+        if not text:
+            raise ValueError(f"No text content found in response: {data!r}")
+
+        text = text.strip()
         text = text.replace("```json", "").replace("```", "").strip()
 
         try:
