@@ -394,7 +394,7 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 
 INCIDENT_TERMS_A = [
     "exploit", "hacked", "breach", "drained", "compromised",
-    "rugpull", "reentrancy", "private key leaked", "wallet drained",
+    "rugpull", "private key leaked", "wallet drained",
     "bridge exploit",
     # Post-hack fund movement / threat-actor tracking — distinct from an
     # active fresh exploit, but valuable for spotting stolen funds heading
@@ -409,8 +409,8 @@ INCIDENT_TERMS_A = [
 
 # Context (crypto-relevance) terms ANDed against INCIDENT_TERMS_A.
 CONTEXT_A = [
-    "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
-    "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
+    "crypto", "bitcoin", "ethereum", "solana",
+    "exchange", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
     "eth", "btc",
     "blockchain", "mainnet", "chain", "validators", "governance",
 ]
