@@ -303,6 +303,83 @@ inside its own boundary.
 - **If the process restarts** (deploys, host maintenance, etc.), it resets
   to "look back 5 minutes" rather than remembering history from before the
   restart — so a restart could very rarely cause a brief gap or a small
-  amount of overlap. For a mission-critical setup, ask and I can add
-  persistent state (e.g. a small Redis or database) so it survives
-  restarts with zero gaps.
+  amount of overlap. Case tracking (below) does now persist across
+  restarts once Redis is set up, but `since_id` itself still doesn't.
+
+## Case tracking + on-demand incident reports (optional)
+
+When you turn this on, the bot keeps a persistent record per incident —
+tokens affected, estimated loss, latest official response, attacker
+address(es), where funds are moving, and status (ongoing/contained/
+resolved) — updated automatically every time a new tweet adds something.
+Repeat tweets about a case you already know about are **not** re-alerted
+unless they add real new information, but every tweet still updates the
+record, so the full picture keeps building even while you're not getting
+pinged about it.
+
+You can then pull the full synthesized report for any case, on demand,
+sent straight to your Telegram chat.
+
+### Step A — Add Redis to your Railway project
+
+1. Open your project in the Railway dashboard.
+2. Click **"+ New"** → **"Database"** → **"Add Redis"**. Railway
+   provisions it in a few seconds.
+3. Click on your bot's own service (not the new Redis one) → **Variables**
+   tab → **"+ New Variable"** → click **"Add Reference"** → pick the Redis
+   service's `REDIS_URL`. This wires your bot up to it without you typing
+   any connection string by hand.
+4. Redeploy (Railway usually does this automatically when a variable
+   changes). Check the deploy logs for a line starting with
+   `Case tracking: ON` — that confirms it connected.
+
+That's it for the bot's side — it now tracks cases automatically. No code
+changes needed.
+
+### Step B — One-time setup to pull reports on demand
+
+Pulling a report runs a small script from your own PC (via the Railway
+CLI), which then posts the result to your Telegram chat. This needs two
+things installed once:
+
+1. **Python** — if you don't already have it, install it from
+   [python.org](https://www.python.org/downloads/) (check "Add python.exe
+   to PATH" during install on Windows).
+2. **Railway CLI** — open Command Prompt / PowerShell and run:
+   ```
+   npm install -g @railway/cli
+   ```
+   (If you don't have `npm`, install [Node.js](https://nodejs.org/) first —
+   it comes bundled with npm.)
+3. Log in and link this project:
+   ```
+   railway login
+   ```
+   (opens a browser to authorize)
+   ```
+   cd path\to\your\crypto-alert-bot\folder
+   railway link
+   ```
+   Pick your project/environment/service when prompted. You also need the
+   two extra Python packages this script uses — from that same folder:
+   ```
+   pip install -r requirements.txt
+   ```
+
+You only do Step B once. After that, pulling a report is a single command.
+
+### Pulling a report
+
+From inside the project folder on your PC:
+```
+railway run python case_report.py egld
+```
+Replace `egld` with any word from the incident's name — it matches
+partial/case-insensitive, so you don't need to remember the exact
+internal key. If it matches more than one case (or none), you'll get a
+list back on Telegram instead of a report, so you can try again with a
+more specific word. Running it with no search term at all lists every
+known case:
+```
+railway run python case_report.py
+```

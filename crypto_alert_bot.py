@@ -22,6 +22,11 @@ import json
 import requests
 from datetime import datetime, timedelta, timezone
 
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
+
 # ---------------------------------------------------------------------------
 # Configuration (all pulled from environment variables / GitHub Secrets)
 # ---------------------------------------------------------------------------
@@ -91,6 +96,172 @@ def recent_alerts_context() -> str:
     if not recent_alerts:
         return "(none yet)"
     return "\n".join(f"- {a['summary']}" for a in recent_alerts)
+
+
+# ---------------------------------------------------------------------------
+# Persistent case store (Redis) — one structured record per incident,
+# keyed by the AI's own "case_key" (e.g. "egld_multiversx_exploit"). Unlike
+# recent_alerts above (short-term, in-memory, resets on restart), this is
+# meant to last: it survives restarts/redeploys and has no fixed retention
+# window, so "have we already told the risk officer about this incident"
+# can be answered days or weeks later, not just within a few hours.
+#
+# Only active when REDIS_URL is set (a free Railway Redis add-on works
+# fine). Without it, the bot still runs exactly as before — no case
+# tracking, no dedup-by-case, no on-demand case reports — it just can't
+# remember incidents across restarts.
+# ---------------------------------------------------------------------------
+
+REDIS_URL = os.environ.get("REDIS_URL")
+CASE_KEY_PREFIX = "crypto_alert_bot:case:"
+CASE_INDEX_KEY = "crypto_alert_bot:case_index"  # a Redis SET of every known case_key
+CASE_MAX_UPDATES_STORED = 40  # cap per-case update history so records can't grow unbounded
+
+_redis_client = None
+_redis_unavailable_warned = False
+
+
+def get_redis():
+    """
+    Returns a connected Redis client, or None if REDIS_URL isn't set or the
+    library/connection isn't available. Callers should treat None as "case
+    tracking is off" and degrade gracefully (skip persistence, don't crash).
+    """
+    global _redis_client, _redis_unavailable_warned
+    if not REDIS_URL:
+        return None
+    if redis_lib is None:
+        if not _redis_unavailable_warned:
+            print("REDIS_URL is set but the 'redis' package isn't installed — "
+                  "case tracking is disabled. Check requirements.txt.", file=sys.stderr)
+            _redis_unavailable_warned = True
+        return None
+    if _redis_client is None:
+        try:
+            _redis_client = redis_lib.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
+            _redis_client.ping()
+        except Exception as e:
+            if not _redis_unavailable_warned:
+                print(f"Could not connect to Redis (case tracking disabled): {e}", file=sys.stderr)
+                _redis_unavailable_warned = True
+            _redis_client = None
+    return _redis_client
+
+
+def get_case(case_key: str):
+    """Returns the stored case dict for case_key, or None if it doesn't exist / Redis is off."""
+    r = get_redis()
+    if not r or not case_key:
+        return None
+    raw = r.get(CASE_KEY_PREFIX + case_key)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def save_case(case_key: str, case: dict):
+    """Persists a case dict and registers it in the searchable index."""
+    r = get_redis()
+    if not r or not case_key:
+        return
+    r.set(CASE_KEY_PREFIX + case_key, json.dumps(case))
+    r.sadd(CASE_INDEX_KEY, case_key)
+
+
+def list_case_keys() -> list[str]:
+    """Returns every known case_key (used by case_report.py to search)."""
+    r = get_redis()
+    if not r:
+        return []
+    return sorted(r.smembers(CASE_INDEX_KEY))
+
+
+# Fields we track structured facts in, beyond the free-text summary — these
+# are what get diffed to decide whether a repeat mention of a known case
+# counts as "new information" worth alerting on again.
+CASE_TRACKED_FIELDS = [
+    "tokens_affected", "estimated_loss_usd", "latest_official_response",
+    "hacker_addresses", "asset_movement", "status",
+]
+
+# Placeholder values the AI might legitimately return that should NOT count
+# as real information when diffing (so they don't falsely trigger "this is
+# new" the first time a field goes from empty to "unknown").
+_CASE_FIELD_EMPTY_VALUES = {"", "unknown", "not stated", "n/a", "none", "not specified"}
+
+
+def _normalize_case_field(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def diff_case_fields(old_case: dict, new_fields: dict) -> list[str]:
+    """
+    Compares new_fields (freshly extracted by the AI for this tweet)
+    against what's already stored for this case, and returns the list of
+    tracked field names that changed meaningfully. An empty list means
+    "nothing new" — the tweet is a repeat of what we already know.
+    """
+    changed = []
+    for field in CASE_TRACKED_FIELDS:
+        new_val = _normalize_case_field(new_fields.get(field, ""))
+        old_val = _normalize_case_field(old_case.get(field, ""))
+        if new_val in _CASE_FIELD_EMPTY_VALUES:
+            continue  # the AI didn't learn anything new for this field this time
+        if new_val != old_val:
+            changed.append(field)
+    return changed
+
+
+def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str,
+                 fields: dict, first_seen_estimate: str) -> tuple[bool, list[str]]:
+    """
+    Creates or updates the persistent record for case_key with this tweet's
+    info. Returns (is_new_case, changed_fields) — is_new_case is True the
+    very first time this case_key is seen; changed_fields lists which
+    tracked fields (see CASE_TRACKED_FIELDS) actually carried new
+    information versus what was already stored. Callers use this to decide
+    whether to alert (new case, or changed_fields non-empty) or suppress
+    (existing case, nothing new) while still recording the update either way.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    existing = get_case(case_key)
+    is_new = existing is None
+
+    if is_new:
+        changed_fields = [f for f in CASE_TRACKED_FIELDS
+                           if _normalize_case_field(fields.get(f, "")) not in _CASE_FIELD_EMPTY_VALUES]
+        case = {
+            "case_key": case_key,
+            "display_name": case_key.replace("_", " ").title(),
+            "first_seen": now_iso,
+            "last_seen": now_iso,
+            "updates": [],
+        }
+        for f in CASE_TRACKED_FIELDS:
+            case[f] = fields.get(f, "") or ""
+    else:
+        changed_fields = diff_case_fields(existing, fields)
+        case = existing
+        case["last_seen"] = now_iso
+        for f in changed_fields:
+            case[f] = fields.get(f, "") or ""
+
+    case["updates"].append({
+        "time": now_iso,
+        "username": tweet.get("username", "unknown"),
+        "tweet_id": tweet.get("id", ""),
+        "score": score,
+        "label": label,
+        "summary": summary,
+        "first_seen_estimate": first_seen_estimate,
+    })
+    case["updates"] = case["updates"][-CASE_MAX_UPDATES_STORED:]
+
+    save_case(case_key, case)
+    return is_new, changed_fields
 
 
 def _call_claude(system_prompt: str, user_message: str, max_tokens: int) -> str:
@@ -523,6 +694,33 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         "NEVER as an actual line break, or the JSON will fail to parse.\n"
         '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
         '"first_seen_estimate": "<see RECENCY instructions below>", '
+        '"case_key": "<a short, STABLE lowercase_underscore identifier for '
+        "this SPECIFIC incident, based on the project/protocol name + "
+        "incident type, e.g. 'liquid_network_exploit', "
+        "'egld_multiversx_incident_2026_09'. Use the EXACT SAME key for any "
+        "other tweet about this same incident, no matter who's tweeting or "
+        "how they phrase it — this is a database key, so consistency "
+        "matters more than cleverness. If no project/protocol name is "
+        'identifiable, use \'unknown_\' plus a few words for the incident '
+        'type. If is_real_incident is false, still fill this in your best '
+        'guess (used for dedup even on borderline calls)>", '
+        '"tokens_affected": "<comma-separated token/coin symbols or names '
+        'affected, or \'unknown\' if not stated>", '
+        '"estimated_loss_usd": "<your best current estimate, e.g. \'~$3M\', '
+        '\'$109K\', or \'unknown\' if no figure is given anywhere in the '
+        'tweet>", '
+        '"latest_official_response": "<what the project/exchange/official '
+        "channel has said or done so far (paused, investigating, "
+        "reimbursing, silent, etc.), or 'unknown' if this tweet doesn't say"
+        '>", '
+        '"hacker_addresses": "<any attacker/contract/destination wallet '
+        'addresses mentioned, comma-separated, or \'unknown\' if none>", '
+        '"asset_movement": "<brief note on where stolen funds are known to '
+        'be moving/going, e.g. \'bridged to Ethereum, partially swapped to '
+        'ETH\', or \'unknown\' if not stated>", '
+        '"status": "<one of: ongoing (actively unfolding/unresolved), '
+        "contained (halted/paused but not fully resolved), resolved "
+        "(funds recovered/attacker caught/situation closed), or unknown>\", "
         '"summary": "<HARD LIMIT: 140 characters, no exceptions — this is '
         "read on a phone alert, not a report. ONE compact sentence in the "
         "shape '<Project/token name, or \\'Unknown\\'>: <what's happening>' "
@@ -533,6 +731,19 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         '"reasoning": "<one short sentence on why this score, including '
         'your source-credibility AND recency judgment>"}\n\n'
         f"{recency_instructions}\n\n"
+        "CASE TRACKING — case_key and the tokens_affected/estimated_loss_usd/"
+        "latest_official_response/hacker_addresses/asset_movement/status "
+        "fields feed a persistent database keyed by case_key: every tweet "
+        "you classify with the SAME case_key updates the SAME record. Fill "
+        "in every field you can from THIS tweet alone — don't leave a field "
+        "'unknown' if the tweet actually states it (a later update filling "
+        "in a previously-unknown field, like a newly-revealed attacker "
+        "address or a status change to 'resolved', is exactly the kind of "
+        "new information this system exists to catch). Getting case_key "
+        "CONSISTENT across tweets about the same incident matters more "
+        "than anything else in this section — that's what prevents the "
+        "same incident from being treated as new every time someone else "
+        "tweets about it.\n\n"
         "GATE — crypto/blockchain relevance FIRST, before anything else: "
         "this tweet reached you via a keyword search, not a crypto-only "
         "feed, so some tweets will use incident-sounding words ('attack', "
@@ -655,9 +866,10 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
 def _parse_classification_json(text: str, provider: str):
     """
     Shared JSON parsing/repair for classify_with_ai()'s response, used by
-    every provider attempt. Returns (score, label, summary, reasoning,
-    first_seen) on success, or None if the response couldn't be parsed
-    into a usable classification.
+    every provider attempt. Returns a dict with keys: score, label,
+    summary, reasoning, first_seen, case_key, fields (a dict of
+    CASE_TRACKED_FIELDS values) — or None if the response couldn't be
+    parsed into a usable classification.
     """
     try:
         text = text.replace("```json", "").replace("```", "").strip()
@@ -686,6 +898,8 @@ def _parse_classification_json(text: str, provider: str):
             summary = summary[:140].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
         reasoning = parsed.get("reasoning", "").strip()
         first_seen = parsed.get("first_seen_estimate", "unknown").strip()
+        case_key = (parsed.get("case_key", "") or "").strip().lower().replace(" ", "_") or "unknown_incident"
+        fields = {f: (parsed.get(f, "") or "").strip() for f in CASE_TRACKED_FIELDS}
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
 
@@ -697,7 +911,11 @@ def _parse_classification_json(text: str, provider: str):
             label = "MEDIUM"
         else:
             label = "LOW"
-        return score, label, summary, reasoning, first_seen
+        return {
+            "score": score, "label": label, "summary": summary,
+            "reasoning": reasoning, "first_seen": first_seen,
+            "case_key": case_key, "fields": fields,
+        }
 
     except Exception as e:
         print(f"AI response from {provider} couldn't be parsed: {e}\n"
@@ -725,7 +943,8 @@ def classify_with_ai(tweet: dict):
          itself failed (e.g. bad response shape) but the key is still
          presumably valid for plain chat completions.
 
-    Returns (score, label, summary, reasoning, first_seen_estimate), or
+    Returns a dict (see _parse_classification_json() for the exact shape:
+    score, label, summary, reasoning, first_seen, case_key, fields), or
     None if AI scoring isn't configured or every provider's call fails.
     There is no keyword-based fallback — scoring is AI-only, so callers
     should skip the tweet and page on Telegram when this returns None (see
@@ -746,7 +965,7 @@ def classify_with_ai(tweet: dict):
     if XAI_API_KEY and LIVE_SEARCH_RECENCY_CHECK:
         system_prompt = _build_classification_prompt(trusted_list, has_live_search=True)
         try:
-            text = _call_grok_responses_with_search(system_prompt, user_message, max_tokens=600)
+            text = _call_grok_responses_with_search(system_prompt, user_message, max_tokens=800)
             result = _parse_classification_json(text, "grok (live search)")
             if result:
                 return result
@@ -758,7 +977,7 @@ def classify_with_ai(tweet: dict):
     if ANTHROPIC_API_KEY:
         system_prompt = _build_classification_prompt(trusted_list, has_live_search=False)
         try:
-            text = _call_claude(system_prompt, user_message, max_tokens=500)
+            text = _call_claude(system_prompt, user_message, max_tokens=700)
             result = _parse_classification_json(text, "claude")
             if result:
                 return result
@@ -770,7 +989,7 @@ def classify_with_ai(tweet: dict):
     if XAI_API_KEY:
         system_prompt = _build_classification_prompt(trusted_list, has_live_search=False)
         try:
-            text = _call_grok(system_prompt, user_message, max_tokens=500)
+            text = _call_grok(system_prompt, user_message, max_tokens=700)
             result = _parse_classification_json(text, "grok (no search)")
             if result:
                 return result
@@ -1002,8 +1221,12 @@ def run_self_test():
         )
         return
 
-    score, label, summary, reasoning, first_seen = ai_result
-    print(f"Scored via AI: {label} {score}/100 — {reasoning} (first seen: {first_seen})")
+    score = ai_result["score"]
+    label = ai_result["label"]
+    summary = ai_result["summary"]
+    reasoning = ai_result["reasoning"]
+    print(f"Scored via AI: {label} {score}/100 — {reasoning} "
+          f"(first seen: {ai_result['first_seen']}, case: {ai_result['case_key']})")
 
     zh_text = translate_to_chinese(test_tweet["text"])
     message = "🧪 <b>SELF-TEST — not a real incident</b>\n\n" + format_alert(
@@ -1073,7 +1296,13 @@ def run_once(since_id):
             note_ai_failure_and_maybe_alert()
             continue
 
-        score, label, summary, reasoning, first_seen = ai_result
+        score = ai_result["score"]
+        label = ai_result["label"]
+        summary = ai_result["summary"]
+        reasoning = ai_result["reasoning"]
+        first_seen = ai_result["first_seen"]
+        case_key = ai_result["case_key"]
+        fields = ai_result["fields"]
 
         # Always log the score, even for tweets that won't alert — this is
         # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
@@ -1081,7 +1310,7 @@ def run_once(since_id):
         print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
         if reasoning:
             print(f"    reasoning: {reasoning}")
-        print(f"    first seen: {first_seen}")
+        print(f"    first seen: {first_seen} | case: {case_key}")
 
         if likes < MIN_ENGAGEMENT_FILTER:
             print(f"    -> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
@@ -1090,8 +1319,26 @@ def run_once(since_id):
             print(f"    -> skipped (below MIN_RISK_SCORE_TO_ALERT={MIN_RISK_SCORE_TO_ALERT})")
             continue
 
+        # Persistent case tracking: has this exact incident (by case_key)
+        # been recorded before, and if so, did THIS tweet add anything we
+        # didn't already know? Always updates the case record either way —
+        # only the alert itself is suppressed when nothing new showed up.
+        is_new_case, changed_fields = upsert_case(
+            case_key, tweet, score, label, summary, fields, first_seen
+        )
+        if not is_new_case and not changed_fields:
+            print(f"    -> skipped (case '{case_key}' already known, no new "
+                  f"information in this tweet — recorded to case history anyway)")
+            continue
+
+        update_note = ""
+        if not is_new_case and changed_fields:
+            pretty_fields = ", ".join(f.replace("_", " ") for f in changed_fields)
+            update_note = f"🔄 <b>CASE UPDATE</b> ({pretty_fields})\n\n"
+            print(f"    -> case update: new info in {pretty_fields}")
+
         zh_text = translate_to_chinese(tweet["text"])
-        message = format_alert(tweet, score, label, zh_text, summary)
+        message = update_note + format_alert(tweet, score, label, zh_text, summary)
         send_telegram_alert(message)
         if summary:
             remember_alert(summary)  # so future duplicates of this get suppressed
@@ -1140,6 +1387,23 @@ def main():
             + (" Live-search recency check is OFF." if not XAI_API_KEY
                else " Live-search recency check is disabled (LIVE_SEARCH_RECENCY_CHECK=false).")
         )
+
+    if REDIS_URL:
+        if get_redis():
+            known_cases = len(list_case_keys())
+            print(f"Case tracking: ON (Redis connected) — {known_cases} known "
+                  f"case(s) in the database. Repeat mentions of a known "
+                  f"incident are suppressed unless they add new information "
+                  f"(new loss figure, official response, attacker address, "
+                  f"status change, etc.); the case record is updated either way.")
+        else:
+            print("Case tracking: REDIS_URL is set but Redis is unreachable right "
+                  "now — case tracking is degraded to 'always treat as new' "
+                  "until it reconnects.", file=sys.stderr)
+    else:
+        print("Case tracking: OFF (no REDIS_URL) — every alert-worthy tweet is "
+              "treated as new; no persistent dedup-by-incident or on-demand "
+              "case reports.")
 
     if os.environ.get("SELF_TEST_ON_START", "false").lower() == "true":
         run_self_test()
