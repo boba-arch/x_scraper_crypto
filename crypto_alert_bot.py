@@ -411,8 +411,8 @@ INCIDENT_TERMS_A = [
 CONTEXT_A = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
     "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
-    "eth", "btc",  # common cashtag tickers, not just full chain names
-    "blockchain", "mainnet",
+    "eth", "btc",
+    "blockchain", "mainnet", "chain", "validators", "governance",
 ]
 
 # Query B: softer/operational-disclosure vocabulary — official-sounding
@@ -430,7 +430,7 @@ INCIDENT_TERMS_B = [
 CONTEXT_B = [
     "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
     "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
-    "eth", "btc", "blockchain", "mainnet",
+    "eth", "btc", "blockchain", "mainnet", "chain",
     # NOTE: standalone "network"/"validators" were removed from here — they
     # made this query match non-crypto outage tweets (e.g. an ISP's own
     # network disruption notice) whenever they also contained "under
