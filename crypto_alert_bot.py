@@ -497,8 +497,21 @@ MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "10"))
 # billed batch of reads, so this bounds worst-case cost per poll.
 PAGINATION_MAX_PAGES = int(os.environ.get("PAGINATION_MAX_PAGES", "3"))
 
-# Only alert if the computed risk score is at least this high (0-100).
+# Only alert (send to Telegram) if the computed risk score is at least
+# this high (0-100).
 MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
+
+# Only PERSIST a case to Redis if the score is at least this high — lower
+# than MIN_RISK_SCORE_TO_ALERT on purpose. A tweet can be too weak/unclear
+# on its own to page you about, but still worth quietly recording, so that
+# if a LATER tweet firms it up into something alert-worthy, the case
+# already has this earlier context (first_seen, an early field value,
+# etc.) instead of starting from nothing. Defaults to MIN_RISK_SCORE_TO_ALERT
+# minus 15 (floored at 0) if not set, so out of the box tracking is a bit
+# more permissive than alerting without needing extra configuration.
+MIN_RISK_SCORE_TO_TRACK = int(os.environ.get(
+    "MIN_RISK_SCORE_TO_TRACK", str(max(0, MIN_RISK_SCORE_TO_ALERT - 15))
+))
 
 # ---------------------------------------------------------------------------
 # Keyword / query strategy
@@ -1466,8 +1479,8 @@ def run_once(since_id):
         if likes < MIN_ENGAGEMENT_FILTER:
             print(f"    -> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
             continue
-        if score < MIN_RISK_SCORE_TO_ALERT:
-            print(f"    -> skipped (below MIN_RISK_SCORE_TO_ALERT={MIN_RISK_SCORE_TO_ALERT})")
+        if score < MIN_RISK_SCORE_TO_TRACK:
+            print(f"    -> skipped (below MIN_RISK_SCORE_TO_TRACK={MIN_RISK_SCORE_TO_TRACK})")
             continue
 
         # Safety net: collapse near-duplicate case_keys (see
@@ -1481,14 +1494,23 @@ def run_once(since_id):
 
         # Persistent case tracking: has this exact incident (by case_key)
         # been recorded before, and if so, did THIS tweet add anything we
-        # didn't already know? Always updates the case record either way —
-        # only the alert itself is suppressed when nothing new showed up.
+        # didn't already know? This runs for anything clearing
+        # MIN_RISK_SCORE_TO_TRACK, which is lower than the alert bar — so a
+        # weak/early tweet still gets recorded even when it won't page you,
+        # giving a later tweet about the same case earlier context to
+        # build on. Always updates the case record either way; only the
+        # alert itself is gated further below.
         is_new_case, changed_fields = upsert_case(
             case_key, tweet, score, label, summary, fields, first_seen
         )
         if not is_new_case and not changed_fields:
             print(f"    -> skipped (case '{case_key}' already known, no new "
                   f"information in this tweet — recorded to case history anyway)")
+            continue
+
+        if score < MIN_RISK_SCORE_TO_ALERT:
+            print(f"    -> tracked but not alerted (below MIN_RISK_SCORE_TO_ALERT="
+                  f"{MIN_RISK_SCORE_TO_ALERT}) — case '{case_key}' updated silently")
             continue
 
         update_note = ""
@@ -1511,6 +1533,7 @@ def run_once(since_id):
 def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] Crypto incident monitor starting up.")
     print(f"Polling every {POLL_INTERVAL_SECONDS}s. Alert threshold: {MIN_RISK_SCORE_TO_ALERT}. "
+          f"Track threshold: {MIN_RISK_SCORE_TO_TRACK}. "
           f"Min engagement filter: {MIN_ENGAGEMENT_FILTER} likes.")
     for i, q in enumerate(build_queries(), start=1):
         print(f"Search query {i}: {q}")
