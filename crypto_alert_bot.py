@@ -179,6 +179,51 @@ def list_case_keys() -> list[str]:
     return sorted(r.smembers(CASE_INDEX_KEY))
 
 
+# How many of the most-recently-updated cases to show the AI as candidates
+# for case_key reuse (see get_open_cases_context() below). Kept small so it
+# doesn't blow up the prompt, but wide enough to cover "this got tweeted
+# about by 10 different accounts within an hour" bursts.
+OPEN_CASES_CONTEXT_LIMIT = 20
+
+
+def get_open_cases_context() -> str:
+    """
+    Returns a compact, newline-per-case text block describing the
+    most-recently-updated known cases (case_key, display name, status, and
+    latest summary) — fed to the AI classifier so it can REUSE an existing
+    case_key for a tweet about an incident it already knows, instead of
+    inventing a new one blind. Without this, every call is stateless and
+    the AI has no way to know what an incident was already named, which is
+    what caused the same real-world incident to fragment into many
+    different case_keys (e.g. "cosmos_hub_noble_exploit",
+    "cosmos_hub_neutron_attack", "cosmos_hub_governance_exploit", ...).
+
+    Returns "(none yet)" if case tracking is off or no cases exist yet.
+    """
+    r = get_redis()
+    if not r:
+        return "(none yet)"
+    case_keys = list_case_keys()
+    if not case_keys:
+        return "(none yet)"
+
+    cases = [c for c in (get_case(k) for k in case_keys) if c]
+    cases.sort(key=lambda c: c.get("last_seen", ""), reverse=True)
+    cases = cases[:OPEN_CASES_CONTEXT_LIMIT]
+
+    lines = []
+    for c in cases:
+        latest_summary = ""
+        if c.get("updates"):
+            latest_summary = c["updates"][-1].get("summary", "")
+        lines.append(
+            f"- case_key=\"{c['case_key']}\" | {c.get('display_name', c['case_key'])} "
+            f"| status: {c.get('status', 'unknown')} "
+            f"| last update: {latest_summary or '(none)'}"
+        )
+    return "\n".join(lines)
+
+
 # Fields we track structured facts in, beyond the free-text summary — these
 # are what get diffed to decide whether a repeat mention of a known case
 # counts as "new information" worth alerting on again.
@@ -394,7 +439,7 @@ MIN_RISK_SCORE_TO_ALERT = int(os.environ.get("MIN_RISK_SCORE_TO_ALERT", "25"))
 
 INCIDENT_TERMS_A = [
     "exploit", "hacked", "breach", "drained", "compromised",
-    "rugpull", "private key leaked", "wallet drained",
+    "rugpull", "reentrancy", "private key leaked", "wallet drained",
     "bridge exploit",
     # Post-hack fund movement / threat-actor tracking — distinct from an
     # active fresh exploit, but valuable for spotting stolen funds heading
@@ -409,10 +454,23 @@ INCIDENT_TERMS_A = [
 
 # Context (crypto-relevance) terms ANDed against INCIDENT_TERMS_A.
 CONTEXT_A = [
-    "crypto", "bitcoin", "ethereum", "solana",
-    "exchange", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
-    "eth", "btc",
-    "blockchain", "mainnet", "chain", "validators", "governance",
+    "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
+    "exchange", "dex", "bsc", "bnb",
+    "eth", "btc",  # common cashtag tickers, not just full chain names
+    "blockchain", "mainnet", "chain",
+    # "validators"/"governance" are safe to add HERE (but not to CONTEXT_B —
+    # see the note below) because query A's incident terms are already hard,
+    # unambiguous attack vocabulary ("exploit", "hacked", "rugpull", ...),
+    # so an unrelated tweet pairing one of those with "validators" or
+    # "governance" is very unlikely. Added after missing a real incident
+    # (Cosmos Hub/Neutron, Sep 2026) whose tweet said "governance exploit"
+    # and "validators" but never used a generic crypto word like "eth"/"btc".
+    "validators", "governance",
+    # "polygon"/"arbitrum"/"avalanche" were dropped to make room for the
+    # above — X's query parameter has a hard 512-char cap, and this query
+    # was going over it (542 chars). The generic "chain"/"blockchain"/
+    # "defi" terms already added above still catch tweets about those
+    # chains as long as the tweet also uses one of those broader words.
 ]
 
 # Query B: softer/operational-disclosure vocabulary — official-sounding
@@ -697,11 +755,20 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         '"case_key": "<a short, STABLE lowercase_underscore identifier for '
         "this SPECIFIC incident, based on the project/protocol name + "
         "incident type, e.g. 'liquid_network_exploit', "
-        "'egld_multiversx_incident_2026_09'. Use the EXACT SAME key for any "
-        "other tweet about this same incident, no matter who's tweeting or "
-        "how they phrase it — this is a database key, so consistency "
-        "matters more than cleverness. If no project/protocol name is "
-        'identifiable, use \'unknown_\' plus a few words for the incident '
+        "'egld_multiversx_incident_2026_09'. CHECK THE 'Known open cases' "
+        "list in the user message FIRST — if this tweet is plausibly about "
+        "the SAME incident as one already listed (same project/protocol/"
+        "chain, even if this tweet names a different affected app on it, "
+        "uses different wording, or emphasizes a different angle — e.g. "
+        "one tweet says 'Neutron exploit', another says 'Cosmos Hub "
+        "halted', another says 'governance exploit' — these are likely ONE "
+        "incident), COPY that case_key EXACTLY, character for character, "
+        "rather than writing your own variant of it. Only invent a new "
+        "case_key if this genuinely doesn't match anything listed. This is "
+        "a database key: reusing an existing key correctly matters far "
+        "more than an elegant new one — when in doubt, reuse. If no "
+        "project/protocol name is identifiable, use 'unknown_' plus a few "
+        'words for the incident '
         'type. If is_real_incident is false, still fill this in your best '
         'guess (used for dedup even on borderline calls)>", '
         '"tokens_affected": "<comma-separated token/coin symbols or names '
@@ -743,7 +810,12 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         "CONSISTENT across tweets about the same incident matters more "
         "than anything else in this section — that's what prevents the "
         "same incident from being treated as new every time someone else "
-        "tweets about it.\n\n"
+        "tweets about it. The user message includes a 'Known open cases' "
+        "list precisely so you can reuse an existing case_key instead of "
+        "guessing — always check it before writing a case_key, and copy "
+        "an existing one exactly when this tweet is plausibly the same "
+        "incident, even if this tweet describes a different angle "
+        "(different affected app, different wording) of it.\n\n"
         "GATE — crypto/blockchain relevance FIRST, before anything else: "
         "this tweet reached you via a keyword search, not a crypto-only "
         "feed, so some tweets will use incident-sounding words ('attack', "
@@ -956,9 +1028,12 @@ def classify_with_ai(tweet: dict):
     username = tweet.get("username", "unknown")
     trusted_list = ", ".join(sorted(TRUSTED_ACCOUNTS))
     verified_note = "verified" if tweet.get("verified") else "not verified"
+    open_cases = get_open_cases_context()
     user_message = (
         f"Tweet author: @{username} ({verified_note} account)\n"
-        f"Tweet text: {tweet['text']}"
+        f"Tweet text: {tweet['text']}\n\n"
+        f"Known open cases (reuse a case_key from here if this tweet is "
+        f"about one of these — see case_key instructions):\n{open_cases}"
     )
 
     # 1. Grok + live X search (best — merged classification + recency).
