@@ -260,6 +260,82 @@ def diff_case_fields(old_case: dict, new_fields: dict) -> list[str]:
     return changed
 
 
+# Words too generic to prove two case_keys are about the SAME incident —
+# stripped out before comparing, so "cosmos_hub_governance_exploit" and
+# "cosmos_hub_validators_halt" are still recognized as sharing "cosmos"/
+# "hub" even though neither incident-type word matches.
+_CASE_KEY_STOPWORDS = {
+    "exploit", "exploited", "hack", "hacked", "hacker", "incident",
+    "attack", "attacked", "breach", "breached", "halt", "halted",
+    "halting", "suspended", "paused", "frozen", "vulnerability",
+    "governance", "validators", "validator", "network", "chain",
+    "protocol", "unknown", "token", "tokens", "security", "issue",
+}
+
+# How far back (in hours) to look for a case to merge a near-duplicate
+# case_key into. Long enough to catch an incident that keeps getting
+# re-reported over a few days, short enough not to merge into stale,
+# long-resolved cases that happen to share a project name.
+CASE_MERGE_LOOKBACK_HOURS = 24 * 7
+
+
+def _case_key_tokens(case_key: str) -> set[str]:
+    """Distinctive (non-generic) tokens in a case_key, used to detect
+    near-duplicate case_keys for the same real-world incident."""
+    return {
+        t for t in case_key.split("_")
+        if t not in _CASE_KEY_STOPWORDS and not t.isdigit() and len(t) > 2
+    }
+
+
+def resolve_case_key(candidate_key: str) -> str:
+    """
+    Safety net for case_key fragmentation. The AI is shown a list of known
+    open cases and told to copy a matching case_key exactly, but free-text
+    generation means it sometimes drifts to a near-duplicate variant
+    anyway — e.g. the same Cosmos Hub/Neutron incident got tagged
+    'cosmos_hub_noble_exploit', 'cosmos_hub_neutron_attack', and
+    'cosmos_hub_governance_exploit' across different tweets, fragmenting
+    one incident into several case records.
+
+    Before a case is created or updated, this checks candidate_key's
+    distinctive tokens against recently-active existing cases; if they
+    overlap, the EARLIEST-created matching case's key is reused instead of
+    the AI's variant, so near-duplicates collapse into one canonical case
+    rather than trusting the AI's exact string every time. Only affects
+    NEW classifications going forward — existing fragmented case records
+    are left as-is (not merged retroactively).
+    """
+    r = get_redis()
+    if not r:
+        return candidate_key
+    if get_case(candidate_key):
+        return candidate_key  # exact match already exists — nothing to resolve
+
+    candidate_tokens = _case_key_tokens(candidate_key)
+    if not candidate_tokens:
+        return candidate_key  # nothing distinctive enough to match on
+
+    now = datetime.now(timezone.utc)
+    best_match = None  # (first_seen_iso, case_key)
+    for key in list_case_keys():
+        case = get_case(key)
+        if not case:
+            continue
+        try:
+            age_hours = (now - datetime.fromisoformat(case.get("last_seen", ""))).total_seconds() / 3600
+        except ValueError:
+            continue
+        if age_hours > CASE_MERGE_LOOKBACK_HOURS:
+            continue
+        if candidate_tokens & _case_key_tokens(key):
+            first_seen = case.get("first_seen") or case.get("last_seen", "")
+            if best_match is None or first_seen < best_match[0]:
+                best_match = (first_seen, key)
+
+    return best_match[1] if best_match else candidate_key
+
+
 def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str,
                  fields: dict, first_seen_estimate: str) -> tuple[bool, list[str]]:
     """
@@ -1393,6 +1469,15 @@ def run_once(since_id):
         if score < MIN_RISK_SCORE_TO_ALERT:
             print(f"    -> skipped (below MIN_RISK_SCORE_TO_ALERT={MIN_RISK_SCORE_TO_ALERT})")
             continue
+
+        # Safety net: collapse near-duplicate case_keys (see
+        # resolve_case_key()) before persisting, in case the AI drifted to
+        # a variant of an existing case instead of reusing it exactly.
+        resolved_key = resolve_case_key(case_key)
+        if resolved_key != case_key:
+            print(f"    -> merged into existing case '{resolved_key}' "
+                  f"(AI proposed '{case_key}')")
+            case_key = resolved_key
 
         # Persistent case tracking: has this exact incident (by case_key)
         # been recorded before, and if so, did THIS tweet add anything we
