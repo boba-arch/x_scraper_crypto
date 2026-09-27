@@ -188,15 +188,25 @@ OPEN_CASES_CONTEXT_LIMIT = 20
 
 def get_open_cases_context() -> str:
     """
-    Returns a compact, newline-per-case text block describing the
-    most-recently-updated known cases (case_key, display name, status, and
-    latest summary) — fed to the AI classifier so it can REUSE an existing
-    case_key for a tweet about an incident it already knows, instead of
-    inventing a new one blind. Without this, every call is stateless and
-    the AI has no way to know what an incident was already named, which is
-    what caused the same real-world incident to fragment into many
-    different case_keys (e.g. "cosmos_hub_noble_exploit",
-    "cosmos_hub_neutron_attack", "cosmos_hub_governance_exploit", ...).
+    Returns a compact, per-case text block describing the most-recently-
+    updated known cases — fed to the AI classifier for TWO purposes:
+
+    1. So it can REUSE an existing case_key for a tweet about an incident
+       it already knows, instead of inventing a new one blind. Without
+       this, every call is stateless and the AI has no way to know what
+       an incident was already named, which is what caused the same
+       real-world incident to fragment into many different case_keys
+       (e.g. "cosmos_hub_noble_exploit", "cosmos_hub_neutron_attack",
+       "cosmos_hub_governance_exploit", ...).
+
+    2. So it can tell whether THIS tweet actually adds a new fact versus
+       just rewording something already on file. This shows the case's
+       CURRENT tracked field values (not just the latest one-line
+       summary) precisely so the AI can compare the tweet's content
+       against them directly and copy a value forward unchanged when
+       nothing substantive has changed — see the "COPY FORWARD, DON'T
+       RESTATE" instructions in the classification prompt, which this
+       feeds into.
 
     Returns "(none yet)" if case tracking is off or no cases exist yet.
     """
@@ -211,17 +221,16 @@ def get_open_cases_context() -> str:
     cases.sort(key=lambda c: c.get("last_seen", ""), reverse=True)
     cases = cases[:OPEN_CASES_CONTEXT_LIMIT]
 
-    lines = []
+    blocks = []
     for c in cases:
-        latest_summary = ""
-        if c.get("updates"):
-            latest_summary = c["updates"][-1].get("summary", "")
-        lines.append(
-            f"- case_key=\"{c['case_key']}\" | {c.get('display_name', c['case_key'])} "
-            f"| status: {c.get('status', 'unknown')} "
-            f"| last update: {latest_summary or '(none)'}"
+        field_lines = "\n".join(
+            f"    {f}: {c.get(f) or 'unknown'}" for f in CASE_TRACKED_FIELDS
         )
-    return "\n".join(lines)
+        blocks.append(
+            f"- case_key=\"{c['case_key']}\" | {c.get('display_name', c['case_key'])}\n"
+            f"{field_lines}"
+        )
+    return "\n".join(blocks)
 
 
 # Fields we track structured facts in, beyond the free-text summary — these
@@ -232,6 +241,17 @@ CASE_TRACKED_FIELDS = [
     "hacker_addresses", "asset_movement", "status",
 ]
 
+# Of CASE_TRACKED_FIELDS, only these re-trigger a Telegram alert when they
+# change on a case you already know about (the FIRST alert for a new case
+# always fires regardless). Rationale: once an incident is known, a rising
+# loss estimate or reworded official statement isn't actionable — what's
+# actionable is where the stolen funds are moving and who holds them now,
+# or the incident wrapping up (funds recovered/attacker caught). Edit this
+# set if you want more/less re-alerting on updates.
+ALERT_WORTHY_UPDATE_FIELDS = {
+    "asset_movement", "hacker_addresses", "status", "latest_official_response",
+}
+
 # Placeholder values the AI might legitimately return that should NOT count
 # as real information when diffing (so they don't falsely trigger "this is
 # new" the first time a field goes from empty to "unknown").
@@ -240,6 +260,98 @@ _CASE_FIELD_EMPTY_VALUES = {"", "unknown", "not stated", "n/a", "none", "not spe
 
 def _normalize_case_field(value: str) -> str:
     return (value or "").strip().lower()
+
+
+# tokens_affected/hacker_addresses are comma-separated lists — the AI can
+# reorder or reformat them tweet to tweet without meaning anything changed,
+# so these are compared as sets (and only "changed" if the new set adds
+# something not already known), not as exact strings.
+_CASE_FIELD_LIST_TYPE = {"tokens_affected", "hacker_addresses"}
+
+# estimated_loss_usd/latest_official_response/asset_movement are free-text
+# narrative the AI writes fresh every call — the SAME fact routinely comes
+# back reworded ("~$20M" vs "$20 million estimated", "paused, investigating"
+# vs "investigation ongoing"), which exact-string comparison mistakes for
+# new information, firing a repeat "CASE UPDATE" alert for nothing. These
+# are compared by text similarity instead, and only count as changed once
+# the wording diverges enough to plausibly be a different fact, not just a
+# different phrasing of the same one.
+_CASE_FIELD_FUZZY_TYPE = {
+    "estimated_loss_usd", "latest_official_response", "asset_movement",
+}
+# Below this word-overlap ratio, two versions of a narrative field are
+# treated as different facts rather than a reworded repeat of the same one.
+_CASE_FIELD_WORD_OVERLAP_THRESHOLD = 0.3
+# A new loss estimate only counts as "changed" once it moves more than this
+# fraction away from the old one — small re-estimates ($19.8M -> $20.1M)
+# are noise, not new information.
+_CASE_FIELD_USD_TOLERANCE = 0.25
+
+_USD_AMOUNT_RE = re.compile(r"\$?\s*([\d.]+)\s*(k|m|b|thousand|million|billion)?")
+_USD_UNIT_MULTIPLIERS = {
+    "k": 1e3, "thousand": 1e3,
+    "m": 1e6, "million": 1e6,
+    "b": 1e9, "billion": 1e9,
+}
+
+
+def _extract_usd_amount(text: str) -> float | None:
+    """Pulls a rough USD figure out of strings like '~$20M', '$109K', or
+    '$3.2 million' (already-lowercased text). None if no number is found."""
+    match = _USD_AMOUNT_RE.search(text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        amount = float(match.group(1))
+    except ValueError:
+        return None
+    return amount * _USD_UNIT_MULTIPLIERS.get(match.group(2) or "", 1)
+
+
+# Common English filler words stripped before comparing narrative fields —
+# without this, two rewordings of the same fact ("paused... investigating"
+# vs "remains paused while the investigation continues") can share so few
+# CONTENT words that overlap looks artificially low.
+_ENGLISH_STOPWORDS = {
+    "and", "the", "has", "is", "at", "while", "to", "a", "an", "of", "in",
+    "on", "for", "with", "was", "were", "it", "its", "this", "that", "are",
+    "been", "being", "from", "as", "by", "so", "far", "still", "now",
+}
+
+
+def _word_set(text: str) -> set[str]:
+    return {
+        w for w in re.findall(r"[a-z0-9']+", text)
+        if len(w) > 2 and w not in _ENGLISH_STOPWORDS
+    }
+
+
+def _case_field_changed(field: str, old_val: str, new_val: str) -> bool:
+    """True if new_val represents genuinely new information for `field`
+    versus old_val (both already lowercased/stripped), using a comparison
+    suited to that field's shape rather than blind exact-string equality
+    (the AI reworks free-text fields every call, so exact matching treats
+    a rephrasing of the same fact as new information)."""
+    if field in _CASE_FIELD_LIST_TYPE:
+        old_set = {v.strip() for v in old_val.split(",") if v.strip()}
+        new_set = {v.strip() for v in new_val.split(",") if v.strip()}
+        return not new_set.issubset(old_set)
+
+    if field == "estimated_loss_usd":
+        old_amount = _extract_usd_amount(old_val)
+        new_amount = _extract_usd_amount(new_val)
+        if old_amount and new_amount:
+            return abs(new_amount - old_amount) / old_amount > _CASE_FIELD_USD_TOLERANCE
+        # no parseable number on one side — fall through to word overlap
+
+    if field in _CASE_FIELD_FUZZY_TYPE:
+        old_words, new_words = _word_set(old_val), _word_set(new_val)
+        if not old_words or not new_words:
+            return new_val != old_val
+        overlap = len(old_words & new_words) / len(old_words | new_words)
+        return overlap < _CASE_FIELD_WORD_OVERLAP_THRESHOLD
+
+    return new_val != old_val  # status and anything else: exact match is fine
 
 
 def diff_case_fields(old_case: dict, new_fields: dict) -> list[str]:
@@ -255,7 +367,10 @@ def diff_case_fields(old_case: dict, new_fields: dict) -> list[str]:
         old_val = _normalize_case_field(old_case.get(field, ""))
         if new_val in _CASE_FIELD_EMPTY_VALUES:
             continue  # the AI didn't learn anything new for this field this time
-        if new_val != old_val:
+        if old_val in _CASE_FIELD_EMPTY_VALUES:
+            changed.append(field)  # first time we've learned this field at all
+            continue
+        if _case_field_changed(field, old_val, new_val):
             changed.append(field)
     return changed
 
@@ -288,37 +403,102 @@ def _case_key_tokens(case_key: str) -> set[str]:
     }
 
 
-def resolve_case_key(candidate_key: str) -> str:
-    """
-    Safety net for case_key fragmentation. The AI is shown a list of known
-    open cases and told to copy a matching case_key exactly, but free-text
-    generation means it sometimes drifts to a near-duplicate variant
-    anyway — e.g. the same Cosmos Hub/Neutron incident got tagged
-    'cosmos_hub_noble_exploit', 'cosmos_hub_neutron_attack', and
-    'cosmos_hub_governance_exploit' across different tweets, fragmenting
-    one incident into several case records.
+# Words too generic/incident-y to serve as a case's own identity when
+# minting a fallback case_key straight from tweet text (see
+# _fallback_case_key_from_text()). Deliberately overlaps _CASE_KEY_STOPWORDS
+# but includes plain-English words too, since this runs on raw tweet prose
+# rather than an already-terse case_key.
+_FALLBACK_NAME_IGNORE = _CASE_KEY_STOPWORDS | {
+    "breaking", "update", "alert", "report", "reports", "reported",
+    "confirmed", "official", "urgent", "just", "today", "now", "crypto",
+    "the", "backend", "spoofing", "according", "sources", "amid",
+}
 
-    Before a case is created or updated, this checks candidate_key's
-    distinctive tokens against recently-active existing cases; if they
-    overlap, the EARLIEST-created matching case's key is reused instead of
-    the AI's variant, so near-duplicates collapse into one canonical case
-    rather than trusting the AI's exact string every time. Only affects
-    NEW classifications going forward — existing fragmented case records
-    are left as-is (not merged retroactively).
+
+def _fallback_case_key_from_text(tweet_text: str, existing_keys: set[str]) -> str:
+    """
+    Mints a brand-new case_key straight from a tweet's own text, used when
+    the AI's proposed case_key turns out to belong to an unrelated case
+    (see resolve_case_key()) and no better existing match was found. Picks
+    the first capitalized word/phrase in the tweet that isn't generic
+    incident-report boilerplate — usually the project/exchange name — e.g.
+    "Bitget Breach: $387.5M Stolen..." -> "bitget_incident_2026_09".
+    Falls back to "unknown_incident_<month>" if nothing usable is found,
+    and disambiguates with a numeric suffix if that key is already taken.
+    """
+    base = None
+    for m in re.findall(r"\b[A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z][a-zA-Z0-9]{2,}){0,2}\b", tweet_text):
+        slug = "_".join(w.lower() for w in m.split())
+        if slug in _FALLBACK_NAME_IGNORE:
+            continue
+        base = slug
+        break
+    base = base or "unknown"
+
+    month_suffix = datetime.now(timezone.utc).strftime("%Y_%m")
+    key = f"{base}_incident_{month_suffix}"
+    n = 2
+    while key in existing_keys:
+        key = f"{base}_incident_{month_suffix}_{n}"
+        n += 1
+    return key
+
+
+def resolve_case_key(candidate_key: str, tweet_text: str = "") -> str:
+    """
+    Safety net for case_key mistakes in both directions.
+
+    1. FRAGMENTATION: the AI is shown a list of known open cases and told
+       to copy a matching case_key exactly, but free-text generation means
+       it sometimes drifts to a near-duplicate variant anyway — e.g. the
+       same Cosmos Hub/Neutron incident got tagged 'cosmos_hub_noble_exploit',
+       'cosmos_hub_neutron_attack', and 'cosmos_hub_governance_exploit'
+       across different tweets. Distinctive-token overlap with a recently-
+       active case collapses these into one canonical (earliest) case.
+
+    2. WRONG MERGE (the more dangerous direction): the AI sometimes reuses
+       an EXISTING case_key for a genuinely different incident — e.g. a
+       tweet about a Bitget breach got filed under an existing
+       'bybit_safe_delegatecall_exploit_2026_09' case just because both
+       had a similar loss figure, silently corrupting the real Bybit case
+       with unrelated Bitget data. To catch this, any reuse of an existing
+       case_key (whether it's an exact match or a token-overlap merge) is
+       only accepted if the tweet text actually mentions something
+       distinctive about that case. If the AI's exact case_key fails this
+       check and nothing else matches either, a fresh case_key is minted
+       straight from the tweet's own text (see _fallback_case_key_from_text)
+       instead of corrupting the wrong case.
+
+    Only affects NEW classifications going forward — existing fragmented
+    or wrongly-merged case records are left as-is (not fixed retroactively).
     """
     r = get_redis()
     if not r:
         return candidate_key
-    if get_case(candidate_key):
-        return candidate_key  # exact match already exists — nothing to resolve
+
+    text_lower = tweet_text.lower()
+
+    def _mentions(key: str) -> bool:
+        tokens = _case_key_tokens(key)
+        return not tokens or any(t in text_lower for t in tokens)
+
+    existing_keys = set(list_case_keys())
+    existing = get_case(candidate_key)
+    if existing:
+        if not tweet_text or _mentions(candidate_key):
+            return candidate_key  # exact match, and the tweet backs it up
+        print(f"    -> case_key sanity check failed: AI proposed reusing "
+              f"'{candidate_key}' but this tweet doesn't mention any of its "
+              f"distinctive terms — likely a different incident (e.g. a "
+              f"similarly-named project or a coincidentally matching loss "
+              f"figure). Looking for the real match instead.", file=sys.stderr)
 
     candidate_tokens = _case_key_tokens(candidate_key)
-    if not candidate_tokens:
-        return candidate_key  # nothing distinctive enough to match on
-
     now = datetime.now(timezone.utc)
     best_match = None  # (first_seen_iso, case_key)
-    for key in list_case_keys():
+    for key in existing_keys:
+        if key == candidate_key:
+            continue
         case = get_case(key)
         if not case:
             continue
@@ -328,12 +508,27 @@ def resolve_case_key(candidate_key: str) -> str:
             continue
         if age_hours > CASE_MERGE_LOOKBACK_HOURS:
             continue
-        if candidate_tokens & _case_key_tokens(key):
-            first_seen = case.get("first_seen") or case.get("last_seen", "")
-            if best_match is None or first_seen < best_match[0]:
-                best_match = (first_seen, key)
+        if not (candidate_tokens & _case_key_tokens(key)):
+            continue
+        # Token overlap with the candidate alone isn't enough evidence on
+        # its own (the candidate could itself be the wrong case) — the
+        # tweet has to actually back up THIS case too.
+        if tweet_text and not _mentions(key):
+            continue
+        first_seen = case.get("first_seen") or case.get("last_seen", "")
+        if best_match is None or first_seen < best_match[0]:
+            best_match = (first_seen, key)
 
-    return best_match[1] if best_match else candidate_key
+    if best_match:
+        return best_match[1]
+
+    if existing:
+        # candidate_key belongs to a different, unrelated case (sanity
+        # check above failed) and nothing else matched either — don't
+        # corrupt that case; give this tweet its own fresh identity.
+        return _fallback_case_key_from_text(tweet_text, existing_keys)
+
+    return candidate_key
 
 
 def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str,
@@ -905,6 +1100,35 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         "an existing one exactly when this tweet is plausibly the same "
         "incident, even if this tweet describes a different angle "
         "(different affected app, different wording) of it.\n\n"
+        "COPY FORWARD, DON'T RESTATE — this is the most important rule in "
+        "this section, because getting it wrong is what causes the same "
+        "incident to spam multiple alerts in one day. When this tweet "
+        "matches a case in 'Known open cases', that listing shows the "
+        "case's CURRENT known value for EVERY tracked field. Read the "
+        "tweet and genuinely compare it against those values fact-by-fact "
+        "— don't just skim for incident-sounding keywords. For each "
+        "field: if this tweet's version of that fact is the SAME fact as "
+        "what's already listed — the same attacker/destination address "
+        "(even reformatted, checksummed differently, or truncated), the "
+        "same fund-movement claim restated by a different account, the "
+        "same official statement paraphrased, or just a refined/rounded "
+        "loss figure — copy the EXISTING value forward EXACTLY, character "
+        "for character, rather than writing your own fresh rephrasing of "
+        "it. Only write a NEW value for a field when this tweet states a "
+        "fact that is genuinely absent from or different in substance "
+        "from what's already listed — a DIFFERENT address than any "
+        "already known, funds now moving somewhere new, a materially "
+        "different loss figure (not just a more precise version of the "
+        "same one), or an actual status transition (e.g. ongoing -> "
+        "contained -> resolved). A tweet that only repeats or slightly "
+        "rewords already-known facts should come back with every field "
+        "an exact copy of the case's current value — that tells the "
+        "system nothing changed, so it won't re-alert. When genuinely "
+        "unsure whether a fact is new or just reworded, treat it as NOT "
+        "new (copy forward) — the case's update history already has "
+        "every tweet on record for later review, so under-alerting on a "
+        "borderline repeat costs nothing, while over-alerting pages the "
+        "user for no reason.\n\n"
         "GATE — crypto/blockchain relevance FIRST, before anything else: "
         "this tweet reached you via a keyword search, not a crypto-only "
         "feed, so some tweets will use incident-sounding words ('attack', "
@@ -1016,11 +1240,33 @@ def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> st
         "already listed above — even from a different account, with "
         "different wording — set is_real_incident to FALSE and score low, "
         "with reasoning noting it's a duplicate already alerted on. "
-        "EXCEPTION: if it adds genuinely new, material information (a "
-        "significantly updated loss figure, the attacker identified/"
-        "arrested, funds frozen or recovered, a new protocol/chain "
-        "affected that wasn't previously known), still report it — set "
-        "is_real_incident TRUE and note in the summary what's new."
+        "EXCEPTION — these two kinds of update matter MOST for an ongoing "
+        "case and should always be reported even if everything else about "
+        "the tweet is a repeat: (1) stolen/attacker funds actively moving, "
+        "especially when a specific wallet, contract, or destination "
+        "(exchange deposit address) is named — this is the single most "
+        "actionable update an exchange risk officer can act on, so name "
+        "the address in the summary and score at the HIGH end of the "
+        "45-69 band, or 70+ if the destination is a specific exchange; (2) "
+        "an official response or statement from the affected project or "
+        "an exchange (paused, investigating, reimbursing, frozen funds, "
+        "identified the attacker, etc.) — score at least in the 45-69 "
+        "band for this alone, higher if the response itself is major news "
+        "(funds recovered, attacker caught). Other updates (a modestly "
+        "revised loss estimate, a different account repeating the same "
+        "known facts with no new address or official word) do NOT meet "
+        "this bar — keep those low/duplicate as above.\n\n"
+        "FIRST-MENTION PRIORITY — being the earliest signal of a brand-new "
+        "incident is this system's single most valuable output: it's what "
+        "lets the exchange react before anyone else does. If this tweet "
+        "does not match any case in the 'Known open cases' list AND your "
+        "recency judgment above says it's fresh (first_seen_estimate "
+        "'within the last hour' or 'no earlier mention found'), treat that "
+        "as reason to score at the TOP of whatever band it otherwise falls "
+        "in, even if the report is thin on detail or from an unverified "
+        "account — a vague-but-first report is worth more here than a "
+        "detailed-but-late repeat of an incident everyone already knows "
+        "about."
     )
 
 
@@ -1334,6 +1580,36 @@ def format_alert(tweet: dict, score: int, label: str, zh_text: str, summary: str
     return msg
 
 
+def format_case_update_alert(tweet: dict, score: int, label: str, case_key: str,
+                              changed_fields: list[str], fields: dict) -> str:
+    """
+    Compact alert for an UPDATE to an already-alerted case. Deliberately
+    does NOT re-send the full original tweet, its translation, or a fresh
+    "what happened" recap the way format_alert() does — you already got
+    the full picture on this case's first alert. This shows ONLY the
+    fields that actually changed (see ALERT_WORTHY_UPDATE_FIELDS) plus a
+    link to verify, so a case that keeps accumulating forensic detail
+    throughout the day reads as a short delta each time, not a repeat of
+    the whole incident.
+    """
+    url = f"https://x.com/{tweet['username']}/status/{tweet['id']}"
+    icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}[label]
+    display_name = case_key.replace("_", " ").title()
+
+    lines = [
+        f"• <b>{f.replace('_', ' ').title()}:</b> {html.escape((fields.get(f, '') or '').strip())}"
+        for f in changed_fields if (fields.get(f, "") or "").strip()
+    ]
+    details = "\n".join(lines) if lines else "(see tweet)"
+
+    return (
+        f"🔄 <b>CASE UPDATE — {html.escape(display_name)}</b>\n"
+        f"{icon} Risk: {label} ({score}/100)\n\n"
+        f"{details}\n\n"
+        f"🔗 {url}"
+    )
+
+
 def run_self_test():
     """
     Sends one clearly-labeled TEST alert through the full pipeline
@@ -1486,7 +1762,7 @@ def run_once(since_id):
         # Safety net: collapse near-duplicate case_keys (see
         # resolve_case_key()) before persisting, in case the AI drifted to
         # a variant of an existing case instead of reusing it exactly.
-        resolved_key = resolve_case_key(case_key)
+        resolved_key = resolve_case_key(case_key, tweet["text"])
         if resolved_key != case_key:
             print(f"    -> merged into existing case '{resolved_key}' "
                   f"(AI proposed '{case_key}')")
@@ -1508,19 +1784,36 @@ def run_once(since_id):
                   f"information in this tweet — recorded to case history anyway)")
             continue
 
+        # For an UPDATE to a known case (not its first alert), only re-alert
+        # if something in ALERT_WORTHY_UPDATE_FIELDS changed. A rising loss
+        # estimate or a reworded status on an incident you already know
+        # about isn't worth another Telegram ping — what actually matters
+        # for an already-known hack is where the funds are moving and who's
+        # holding them, so those are what re-trigger an alert. Anything
+        # else that changed is still saved to the case record (for
+        # case_report.py) — it just doesn't page you again.
+        if not is_new_case:
+            alert_worthy_changes = [f for f in changed_fields if f in ALERT_WORTHY_UPDATE_FIELDS]
+            if not alert_worthy_changes:
+                print(f"    -> tracked but not re-alerted (case '{case_key}' updated "
+                      f"in {', '.join(changed_fields)}, none of which are in "
+                      f"ALERT_WORTHY_UPDATE_FIELDS={sorted(ALERT_WORTHY_UPDATE_FIELDS)})")
+                continue
+            changed_fields = alert_worthy_changes
+
         if score < MIN_RISK_SCORE_TO_ALERT:
             print(f"    -> tracked but not alerted (below MIN_RISK_SCORE_TO_ALERT="
                   f"{MIN_RISK_SCORE_TO_ALERT}) — case '{case_key}' updated silently")
             continue
 
-        update_note = ""
-        if not is_new_case and changed_fields:
+        if is_new_case:
+            zh_text = translate_to_chinese(tweet["text"])
+            message = format_alert(tweet, score, label, zh_text, summary)
+        else:
             pretty_fields = ", ".join(f.replace("_", " ") for f in changed_fields)
-            update_note = f"🔄 <b>CASE UPDATE</b> ({pretty_fields})\n\n"
             print(f"    -> case update: new info in {pretty_fields}")
+            message = format_case_update_alert(tweet, score, label, case_key, changed_fields, fields)
 
-        zh_text = translate_to_chinese(tweet["text"])
-        message = update_note + format_alert(tweet, score, label, zh_text, summary)
         send_telegram_alert(message)
         if summary:
             remember_alert(summary)  # so future duplicates of this get suppressed
