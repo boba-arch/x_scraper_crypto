@@ -185,6 +185,15 @@ def list_case_keys() -> list[str]:
 # about by 10 different accounts within an hour" bursts.
 OPEN_CASES_CONTEXT_LIMIT = 20
 
+# Of those, only cases updated within this many hours get the FULL per-
+# field fact dump (needed for the "copy forward, don't restate" check —
+# see get_open_cases_context()). Older cases are very unlikely to get a
+# genuine repeat tweet, so they only need their case_key + status shown
+# (still enough for case_key-reuse matching) rather than all 6 tracked
+# fields — this is what keeps prompt size (and therefore per-call cost)
+# from scaling with total cases ever tracked instead of just active ones.
+OPEN_CASES_FULL_DETAIL_HOURS = 48
+
 
 def get_open_cases_context() -> str:
     """
@@ -197,16 +206,19 @@ def get_open_cases_context() -> str:
        an incident was already named, which is what caused the same
        real-world incident to fragment into many different case_keys
        (e.g. "cosmos_hub_noble_exploit", "cosmos_hub_neutron_attack",
-       "cosmos_hub_governance_exploit", ...).
+       "cosmos_hub_governance_exploit", ...). Every case in the list gets
+       at least this — a one-line case_key/display_name/status entry.
 
     2. So it can tell whether THIS tweet actually adds a new fact versus
-       just rewording something already on file. This shows the case's
-       CURRENT tracked field values (not just the latest one-line
-       summary) precisely so the AI can compare the tweet's content
-       against them directly and copy a value forward unchanged when
-       nothing substantive has changed — see the "COPY FORWARD, DON'T
-       RESTATE" instructions in the classification prompt, which this
-       feeds into.
+       just rewording something already on file — but only for cases
+       updated in the last OPEN_CASES_FULL_DETAIL_HOURS, which get their
+       CURRENT tracked field values shown in full so the AI can compare
+       the tweet's content against them directly and copy a value
+       forward unchanged when nothing substantive has changed (see the
+       "COPY FORWARD, DON'T RESTATE" prompt instructions). A case that's
+       gone quiet for days is very unlikely to get a genuine same-day
+       repeat, so it doesn't need this — keeping the prompt from growing
+       with your total case history instead of just what's currently hot.
 
     Returns "(none yet)" if case tracking is off or no cases exist yet.
     """
@@ -221,15 +233,23 @@ def get_open_cases_context() -> str:
     cases.sort(key=lambda c: c.get("last_seen", ""), reverse=True)
     cases = cases[:OPEN_CASES_CONTEXT_LIMIT]
 
+    now = datetime.now(timezone.utc)
     blocks = []
     for c in cases:
-        field_lines = "\n".join(
-            f"    {f}: {c.get(f) or 'unknown'}" for f in CASE_TRACKED_FIELDS
-        )
-        blocks.append(
-            f"- case_key=\"{c['case_key']}\" | {c.get('display_name', c['case_key'])}\n"
-            f"{field_lines}"
-        )
+        header = f"- case_key=\"{c['case_key']}\" | {c.get('display_name', c['case_key'])}"
+        try:
+            age_hours = (now - datetime.fromisoformat(c.get("last_seen", ""))).total_seconds() / 3600
+        except ValueError:
+            age_hours = None
+
+        if age_hours is not None and age_hours <= OPEN_CASES_FULL_DETAIL_HOURS:
+            field_lines = "\n".join(
+                f"    {f}: {c.get(f) or 'unknown'}" for f in CASE_TRACKED_FIELDS
+            )
+            blocks.append(f"{header}\n{field_lines}")
+        else:
+            blocks.append(f"{header} | status: {c.get('status') or 'unknown'} (older case — "
+                           f"full details omitted, not expected to get same-day updates)")
     return "\n".join(blocks)
 
 
