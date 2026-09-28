@@ -1604,28 +1604,43 @@ def format_case_update_alert(tweet: dict, score: int, label: str, case_key: str,
                               changed_fields: list[str], fields: dict) -> str:
     """
     Compact alert for an UPDATE to an already-alerted case. Deliberately
-    does NOT re-send the full original tweet, its translation, or a fresh
-    "what happened" recap the way format_alert() does — you already got
-    the full picture on this case's first alert. This shows ONLY the
-    fields that actually changed (see ALERT_WORTHY_UPDATE_FIELDS) plus a
-    link to verify, so a case that keeps accumulating forensic detail
+    does NOT re-send the full original tweet or a fresh "what happened"
+    recap the way format_alert() does — you already got the full picture
+    on this case's first alert. This shows ONLY the fields that actually
+    changed (see ALERT_WORTHY_UPDATE_FIELDS), in English and Chinese, plus
+    a link to verify, so a case that keeps accumulating forensic detail
     throughout the day reads as a short delta each time, not a repeat of
-    the whole incident.
+    the whole incident. Chinese translation is via DeepL/free fallback
+    (see translate_to_chinese()) — a separate, cheap service unrelated to
+    the AI classification cost, so there's no reason to skip it here.
     """
     url = f"https://x.com/{tweet['username']}/status/{tweet['id']}"
     icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}[label]
     display_name = case_key.replace("_", " ").title()
 
-    lines = [
-        f"• <b>{f.replace('_', ' ').title()}:</b> {html.escape((fields.get(f, '') or '').strip())}"
+    en_values = [
+        (f, (fields.get(f, "") or "").strip())
         for f in changed_fields if (fields.get(f, "") or "").strip()
     ]
-    details = "\n".join(lines) if lines else "(see tweet)"
+    en_lines = [
+        f"• <b>{f.replace('_', ' ').title()}:</b> {html.escape(v)}" for f, v in en_values
+    ]
+    en_details = "\n".join(en_lines) if en_lines else "(see tweet)"
+
+    if en_values:
+        zh_lines = [
+            f"• <b>{f.replace('_', ' ').title()}:</b> {html.escape(translate_to_chinese(v))}"
+            for f, v in en_values
+        ]
+        zh_details = "\n".join(zh_lines)
+    else:
+        zh_details = "(见推文)"
 
     return (
         f"🔄 <b>CASE UPDATE — {html.escape(display_name)}</b>\n"
         f"{icon} Risk: {label} ({score}/100)\n\n"
-        f"{details}\n\n"
+        f"{en_details}\n\n"
+        f"{zh_details}\n\n"
         f"🔗 {url}"
     )
 
