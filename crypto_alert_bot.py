@@ -192,7 +192,7 @@ OPEN_CASES_CONTEXT_LIMIT = 20
 # (still enough for case_key-reuse matching) rather than all 6 tracked
 # fields — this is what keeps prompt size (and therefore per-call cost)
 # from scaling with total cases ever tracked instead of just active ones.
-OPEN_CASES_FULL_DETAIL_HOURS = 48
+OPEN_CASES_FULL_DETAIL_HOURS = 24
 
 
 def get_open_cases_context() -> str:
