@@ -743,7 +743,7 @@ MIN_RISK_SCORE_TO_TRACK = int(os.environ.get(
 
 INCIDENT_TERMS_A = [
     "exploit", "hacked", "breach", "drained", "compromised",
-    "rugpull", "reentrancy", "private key leaked", "wallet drained",
+    "rugpull", "private key leaked", "wallet drained",
     "bridge exploit",
     # Post-hack fund movement / threat-actor tracking — distinct from an
     # active fresh exploit, but valuable for spotting stolen funds heading
