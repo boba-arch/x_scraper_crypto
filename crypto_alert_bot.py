@@ -36,22 +36,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recommended
 
-# AI scoring uses Claude as the primary provider, with automatic failover to
-# Grok if Claude is unreachable/erroring — you only get paged on Telegram if
+# AI scoring uses Grok as the primary provider, with automatic failover to
+# Claude if Grok is unreachable/erroring — you only get paged on Telegram if
 # BOTH fail. Set whichever key(s) you have; at least one is required.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # primary provider (Claude)
-XAI_API_KEY = os.environ.get("XAI_API_KEY")  # fallback provider (Grok)
+XAI_API_KEY = os.environ.get("XAI_API_KEY")  # primary provider (Grok)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # fallback provider (Claude)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
-
-# Recency verification: before sending an alert, ask Grok's LIVE X search
-# (real-time access to X/Twitter — something Claude doesn't have) whether
-# this incident is genuinely new/ongoing, or was already circulating
-# earlier (a stale/old incident being reported again). Requires
-# XAI_API_KEY and a Grok model that supports the x_search tool (see
-# GROK_LIVE_SEARCH_MODEL). Set to "false" to disable and skip this check.
-LIVE_SEARCH_RECENCY_CHECK = os.environ.get("LIVE_SEARCH_RECENCY_CHECK", "true").lower() == "true"
-GROK_LIVE_SEARCH_MODEL = os.environ.get("GROK_LIVE_SEARCH_MODEL", GROK_MODEL)
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
@@ -192,7 +183,7 @@ OPEN_CASES_CONTEXT_LIMIT = 20
 # (still enough for case_key-reuse matching) rather than all 6 tracked
 # fields — this is what keeps prompt size (and therefore per-call cost)
 # from scaling with total cases ever tracked instead of just active ones.
-OPEN_CASES_FULL_DETAIL_HOURS = 24
+OPEN_CASES_FULL_DETAIL_HOURS = 48
 
 
 def get_open_cases_context() -> str:
@@ -646,60 +637,11 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
 
 
 
-def _call_grok_responses_with_search(system_prompt: str, user_message: str, max_tokens: int) -> str:
-    """
-    Calls xAI's /v1/responses endpoint with the x_search tool enabled —
-    Grok's LIVE X search, real-time access to X that Claude does not have.
-    Raises on any failure (caller handles fallback). Note: this endpoint
-    bills x_search usage per post/profile fetched, separate from and in
-    addition to normal chat tokens.
-    """
-    resp = requests.post(
-        "https://api.x.ai/v1/responses",
-        headers={
-            "Authorization": f"Bearer {XAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROK_LIVE_SEARCH_MODEL,
-            "input": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            "tools": [{"type": "x_search"}],
-            "max_output_tokens": max_tokens,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    # The /v1/responses "output" array can contain more than just the
-    # final message — when tools are used (like x_search here), earlier
-    # items are often tool-call/reasoning entries with no "content" field,
-    # so output[0] isn't reliably the message. Scan for the first item
-    # that actually has text content instead of assuming a fixed position.
-    text = None
-    for item in data.get("output", []):
-        for block in item.get("content", []) or []:
-            if isinstance(block, dict) and block.get("text"):
-                text = block["text"]
-                break
-        if text:
-            break
-    if not text:
-        # Fallback for APIs that also expose a flat convenience field.
-        text = data.get("output_text")
-    if not text:
-        raise ValueError(f"No text content found in response: {data!r}")
-    return text.strip()
-
-
 # Common false-positive phrases that share words with our incident terms
 # but are almost never real crypto security incidents (growth hacking,
 # hackathons, unrelated giveaway/airdrop spam). Excluded directly in the
 # X query to cut billed noise.
-NOISE_EXCLUSIONS = ["hackathon", "giveaway", "airdrop"]
+NOISE_EXCLUSIONS = ["giveaway", "airdrop"]
 
 # Hard cap on how many tweets we pull per poll — mainly a safety ceiling for
 # traffic bursts, since since_id tracking already prevents re-reads.
@@ -732,74 +674,25 @@ MIN_RISK_SCORE_TO_TRACK = int(os.environ.get(
 # Keyword / query strategy
 # ---------------------------------------------------------------------------
 
-# We run TWO separate X searches every poll instead of one. Query A covers
-# hard, unambiguous attack vocabulary ("exploit", "hacked", ...). Query B
-# covers the softer, "official statement" vocabulary that real incidents
-# often surface with FIRST — before anyone has confirmed it's an exploit
-# (e.g. "network paused", "under investigation") — which was the exact
-# pattern that caused earlier misses (MultiversX, Ofero Network). Running
-# both costs roughly 2x the reads of a single query, which the user has
-# explicitly said is an acceptable tradeoff for earlier/broader coverage.
+# One X search per poll: (any INCIDENT_TERMS) AND (any CONTEXT_TERMS), minus
+# NOISE_EXCLUSIONS. X caps the query string at 512 characters — check
+# len(build_queries()[0]) after editing these lists (currently ~464).
 
-INCIDENT_TERMS_A = [
+INCIDENT_TERMS = [
     "exploit", "hacked", "breach", "drained", "compromised",
-    "rugpull", "private key leaked", "wallet drained",
-    "bridge exploit",
-    # Post-hack fund movement / threat-actor tracking — distinct from an
-    # active fresh exploit, but valuable for spotting stolen funds heading
-    # toward an exchange. See the AI prompt's scoring guidance for how
-    # these are weighted differently from a fresh exploit.
-    "laundering", "launder", "lazarus",
-    # Broader attack-vector and disclosure vocabulary — added once AI
-    # scoring was trusted to filter the resulting noise.
-    "access control", "unauthorized", "flash loan",
+    "laundering", "launder", "unauthorized", "flash loan",
     "oracle manipulation", "stolen", "phishing",
-]
-
-# Context (crypto-relevance) terms ANDed against INCIDENT_TERMS_A.
-CONTEXT_A = [
-    "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
-    "exchange", "dex", "bsc", "bnb",
-    "eth", "btc",  # common cashtag tickers, not just full chain names
-    "blockchain", "mainnet", "chain",
-    # "validators"/"governance" are safe to add HERE (but not to CONTEXT_B —
-    # see the note below) because query A's incident terms are already hard,
-    # unambiguous attack vocabulary ("exploit", "hacked", "rugpull", ...),
-    # so an unrelated tweet pairing one of those with "validators" or
-    # "governance" is very unlikely. Added after missing a real incident
-    # (Cosmos Hub/Neutron, Sep 2026) whose tweet said "governance exploit"
-    # and "validators" but never used a generic crypto word like "eth"/"btc".
-    "validators", "governance",
-    # "polygon"/"arbitrum"/"avalanche" were dropped to make room for the
-    # above — X's query parameter has a hard 512-char cap, and this query
-    # was going over it (542 chars). The generic "chain"/"blockchain"/
-    # "defi" terms already added above still catch tweets about those
-    # chains as long as the tweet also uses one of those broader words.
-]
-
-# Query B: softer/operational-disclosure vocabulary — official-sounding
-# statements that often appear before "exploit"/"hacked" is ever used.
-INCIDENT_TERMS_B = [
+    # Softer/operational-disclosure vocabulary — real incidents often
+    # surface with these FIRST, before anyone says "exploit"/"hacked".
     "halted", "suspended", "paused", "frozen", "vulnerability",
-    "incident", "security incident", "under investigation",
-    "security investigation", "potential issue", "validators paused",
-    "network paused", "temporarily unavailable",
+    "incident", "under investigation",
 ]
 
-# Context terms ANDed against INCIDENT_TERMS_B. Broader than CONTEXT_A
-# (adds "network"/"validators") since query B's incident terms are vaguer
-# on their own and need the extra context words to stay on-topic.
-CONTEXT_B = [
-    "crypto", "bitcoin", "ethereum", "solana", "defi", "web3",
-    "exchange", "dex", "bsc", "bnb", "polygon", "arbitrum", "avalanche",
-    "eth", "btc", "blockchain", "mainnet", "chain",
-    # NOTE: standalone "network"/"validators" were removed from here — they
-    # made this query match non-crypto outage tweets (e.g. an ISP's own
-    # network disruption notice) whenever they also contained "under
-    # investigation" or similar. INCIDENT_TERMS_B already has "network
-    # paused" and "validators paused" as their own specific phrase terms,
-    # so that coverage isn't lost — this just drops the overly generic
-    # standalone versions.
+# Context (crypto-relevance) terms ANDed against INCIDENT_TERMS.
+CONTEXT_TERMS = [
+    "crypto", "bitcoin", "ethereum", "solana", "defi",
+    "exchange", "dex", "bsc", "bnb", "eth", "btc",
+    "blockchain", "mainnet", "chain", "validators", "governance",
 ]
 
 # Accounts whose reporting is generally high-signal for security incidents.
@@ -825,12 +718,8 @@ def _build_one_query(incident_terms: list[str], context_terms: list[str]) -> str
 
 
 def build_queries() -> list[str]:
-    """Returns the two X search query strings run every poll (A: hard attack
-    vocabulary, B: soft/operational-disclosure vocabulary)."""
-    return [
-        _build_one_query(INCIDENT_TERMS_A, CONTEXT_A),
-        _build_one_query(INCIDENT_TERMS_B, CONTEXT_B),
-    ]
+    """Returns the X search query string(s) run every poll — currently one."""
+    return [_build_one_query(INCIDENT_TERMS, CONTEXT_TERMS)]
 
 
 def _search_one_query(query: str, since_id: str | None):
@@ -925,7 +814,7 @@ def _search_one_query(query: str, since_id: str | None):
 
 def search_recent_tweets(since_id: str | None):
     """
-    Runs BOTH X search queries (build_queries()) every poll, merges and
+    Runs the X search query (build_queries()) every poll, merges and
     dedupes the results by tweet ID, and reconciles a single since_id for
     the next poll. Tweet IDs are Twitter Snowflake IDs, which are globally
     time-ordered across all of Twitter regardless of which query matched —
@@ -969,194 +858,24 @@ def search_recent_tweets(since_id: str | None):
     return list(combined_by_id.values()), newest_id, error_message
 
 
-def _build_classification_prompt(trusted_list: str, has_live_search: bool) -> str:
-    if has_live_search:
-        recency_instructions = (
-            "RECENCY VIA LIVE SEARCH — you have LIVE X SEARCH for this "
-            "call. Find the EARLIEST credible mention of this same "
-            "incident/project being exploited and compare to now. Fold "
-            "this DIRECTLY into risk_score: started within roughly the "
-            "last few hours (or no earlier mention found — this tweet may "
-            "be the earliest signal) scores toward the HIGH end of its "
-            "band. Already reported significantly earlier (yesterday+) "
-            "with no sign it's still unfolding scores LOW (0-24) "
-            "regardless of severity — stale, the response window has "
-            "likely passed. first_seen_estimate: e.g. 'within the last "
-            "hour', '~18 hours ago', 'yesterday', '2+ days ago', or 'no "
-            "earlier mention found'."
-        )
-    else:
-        recency_instructions = (
-            "RECENCY — no live search this call; reason only from the "
-            "tweet's own wording/timing cues, don't claim to have checked "
-            "X. first_seen_estimate: 'not verified (no live search)'."
-        )
-
+def _build_classification_prompt(trusted_list: str) -> str:
     return (
-        "You are risk-management staff at a crypto exchange, watching "
-        "X/Twitter for a NEW, CURRENTLY-HAPPENING security incident (active "
-        "draining, abnormal minting, a bridge/contract exploited right now, "
-        "or even a vague 'X is being exploited' mention) so the exchange "
-        "can pause deposits/withdrawals for the affected coin. Speed "
-        "matters most: teams are usually SLOW to confirm, so the earliest "
-        "signal is a vague, unconfirmed tweet, not an official statement — "
-        "act on that rather than wait for a post-mortem, since by then the "
-        "window to protect the exchange has usually closed.\n\n"
-        "CRYPTO GATE (apply FIRST, overrides everything below, including "
-        "the official-disclosure special case): confirm this is actually "
-        "about crypto/blockchain/DeFi/Web3 (token, protocol, smart "
-        "contract, exchange, wallet, chain, bridge). This search is "
-        "keyword-based, not crypto-restricted, so it also surfaces ISPs, "
-        "telecoms, banks etc. using similar words ('outage', 'breach', "
-        "'under investigation', 'paused'). If NOT plausibly crypto-"
-        "related, set is_real_incident FALSE and risk_score below 10, no "
-        "matter how closely the wording matches a pattern below.\n\n"
-        "SOURCE CREDIBILITY: not restricted to vetted accounts — judge "
-        "credibility, but don't require proof (address, tx hash, exact $) "
-        "before flagging a live-sounding incident; a brief, detail-light "
-        "report from an unverified account is still actionable, not "
-        f"low-scored just for lacking specifics. Trusted: {trusted_list} "
-        "(auto-credible; their absence never downgrades an otherwise "
-        "live-sounding incident). You'll see the author's username and "
-        "X-verified status — verified (esp. an official project account) "
-        "is a meaningful signal too. Reserve low scores for tweets with NO "
-        "incident signal (speculation, jokes, unrelated), not for "
-        "sparse-but-real reports.\n\n"
-        "Respond with ONLY a JSON object, no other text, no markdown "
-        "fences. CRITICAL: valid JSON only — line breaks inside a string "
-        "value must be \\n, never a literal line break.\n"
-        '{"is_real_incident": true or false, "risk_score": <integer 0-100>, '
-        '"first_seen_estimate": "<see RECENCY below>", '
-        '"case_key": "<short STABLE lowercase_underscore id for this '
-        "SPECIFIC incident, e.g. 'liquid_network_exploit'. CHECK 'Known "
-        "open cases' in the user message FIRST — if this tweet is "
-        "plausibly the SAME incident as one listed (same project/"
-        "protocol/chain, even a different affected app/wording/angle), "
-        "COPY that case_key EXACTLY — reusing correctly matters more than "
-        "an elegant new key, so when in doubt, reuse. Only mint a new one "
-        "if nothing listed genuinely matches; use 'unknown_' + a few "
-        "words if no project name is identifiable. Fill this even if "
-        'is_real_incident is false (used for dedup)>", '
-        '"tokens_affected": "<comma-separated symbols/names, or '
-        '\'unknown\'>", '
-        '"estimated_loss_usd": "<best estimate e.g. \'~$3M\', \'$109K\', or '
-        '\'unknown\'>", '
-        '"latest_official_response": "<what the project/exchange has said/'
-        "done (paused, investigating, reimbursing, silent), or "
-        '\'unknown\'>", '
-        '"hacker_addresses": "<attacker/contract/destination addresses, '
-        'comma-separated, or \'unknown\'>", '
-        '"asset_movement": "<where stolen funds are moving, e.g. \'bridged '
-        'to Ethereum, partially swapped to ETH\', or \'unknown\'>", '
-        '"status": "<ongoing (unfolding/unresolved), contained (halted/'
-        "paused not resolved), resolved (recovered/caught/closed), or "
-        'unknown>", '
-        '"summary": "<HARD LIMIT 140 chars — a phone alert, not a report. '
-        "ONE sentence: '<Project name, or 'Unknown'>: <what's happening>' "
-        "e.g. 'Liquid Network: bridge actively being drained, ~$3M out so "
-        "far.' Plain, non-technical, instantly actionable; drop the loss "
-        'figure rather than exceed 140 chars>", '
-        '"reasoning": "<one short sentence: why this score, incl. source-'
-        'credibility AND recency judgment>"}\n\n'
-        f"{recency_instructions}\n\n"
-        "CASE TRACKING: case_key + the 6 tracked fields (tokens_affected, "
-        "estimated_loss_usd, latest_official_response, hacker_addresses, "
-        "asset_movement, status) feed a persistent database keyed by "
-        "case_key — every tweet with the SAME case_key updates the SAME "
-        "record. Fill in every field you can from THIS tweet; don't leave "
-        "one 'unknown' if the tweet states it. case_key CONSISTENCY "
-        "matters more than anything else here — always check 'Known open "
-        "cases' first and copy an existing key exactly whenever this "
-        "tweet is plausibly the same incident, even from a different "
-        "angle.\n\n"
-        "COPY FORWARD, DON'T RESTATE (most important rule here — getting "
-        "it wrong spams the same incident repeatedly in one day): 'Known "
-        "open cases' shows each case's CURRENT value per field. Compare "
-        "this tweet against those fact-by-fact, not just for incident "
-        "keywords. If this tweet's version of a fact is the SAME as "
-        "what's listed — same address even reformatted, same claim/"
-        "statement reworded, just a refined loss figure — copy the "
-        "EXISTING value forward EXACTLY. Only write a NEW value when the "
-        "fact is genuinely absent or different in substance: a DIFFERENT "
-        "address, funds moving somewhere new, a materially different loss "
-        "figure, or a real status transition (ongoing -> contained -> "
-        "resolved). A tweet repeating known facts should return every "
-        "field as an exact copy of the case's current value, so the "
-        "system knows nothing changed and won't re-alert. When unsure, "
-        "copy forward — under-alerting on a borderline repeat costs "
-        "nothing (still logged to case history); over-alerting pages the "
-        "user for no reason.\n\n"
-        "Set is_real_incident TRUE for anything suggesting an incident is "
-        "NEW or CURRENTLY UNFOLDING — active draining, an exploit in "
-        "progress, abnormal minting, funds moving, or even a brief "
-        "unconfirmed 'being exploited right now' mention. Set it FALSE "
-        "for: general/educational commentary on attack techniques; "
-        "retrospectives of old hacks; and POST-MORTEMS published AFTER "
-        "the fact about an incident already stabilized — those come too "
-        "late for a first response, UNLESS they reveal it's actually "
-        "STILL ongoing (attacker still has access, funds still moving, "
-        "not yet patched), then TRUE.\n\n"
-        "SPECIAL CASE — known threat-actor fund movement: a tweet on a "
-        "known actor (e.g. Lazarus) moving/laundering PREVIOUSLY stolen "
-        "funds (not a fresh exploit) is still TRUE — actionable, since "
-        "incoming funds from a known attacker can be flagged before they "
-        "land. Score 30-50, or 60+ if funds are explicitly moving toward "
-        "a specific exchange/CEX deposit address. Note the actor and "
-        "destination in the summary if stated.\n\n"
-        "SPECIAL CASE — security-awareness/PSA posts: a tweet using a "
-        "real (maybe days-old) incident mainly as a springboard for "
-        "generic security advice, not current developments — hallmarks: "
-        "imperative instructions ('Stop.', 'Verify independently'), a "
-        "list of things to never share (seed phrase, private key), or "
-        "closing 'lesson' framing. If a meaningful portion is generic "
-        "advice rather than what's new about THIS incident: FALSE, score "
-        "LOW (10-20), regardless of recap detail or prior familiarity.\n\n"
-        "SPECIAL CASE — official first-party disclosure (CRYPTO ONLY — "
-        "GATE above still applies; not an ISP/telecom outage phrased "
-        "identically): an official crypto project/platform account "
-        "announcing a halt/pause/security investigation — either (a) its "
-        "OWN network/protocol, or (b) its service built on another chain "
-        "is disrupted because THAT chain is paused, even if not the "
-        "account's own. Both are inherently credible without outside "
-        "confirmation — an official channel doesn't tell users their "
-        "funds are affected unless something real is happening. Don't "
-        "downgrade for lacking a stated loss figure. Set TRUE, score "
-        "65-80 by default, 75+ when VERIFIED and/or user funds/"
-        "withdrawals are explicitly affected — that combination should "
-        "essentially always clear 70.\n\n"
-        "SCORING GUIDE — weight CURRENT/ACTIVE status above all else, "
-        "RECENCY (above) as the strongest modifier within a band; source "
-        "credibility adjusts within that, doesn't override either. 0-24: "
-        "no real incident signal, pure noise, a stabilized post-mortem "
-        "with nothing new, or live-search-confirmed stale news. 25-44: "
-        "plausible but light — a brief/early unverified report, or "
-        "routine threat-actor movement with no exchange destination. "
-        "45-69: credible and actively unfolding now even if thin — where "
-        "most fresh chatter lands; push toward 69 the more recent live "
-        "search confirms it. 70-100: confirmed MAJOR incident, currently "
-        "active — fresh (last few hours, or no earlier mention found) "
-        "from a credible source, or an official first-party disruption "
-        "disclosure — large funds at risk, attacker still moving funds, "
-        "or critical infrastructure compromised.\n\n"
-        "DUPLICATE CHECK — incidents already alerted on recently (last "
-        f"{DEDUPE_WINDOW_HOURS:.0f}h):\n{recent_alerts_context()}\n\n"
-        "If this tweet reports the SAME underlying incident as one listed "
-        "above — even a different account/wording — set is_real_incident "
-        "FALSE, score low, note it's a duplicate. EXCEPTION (same bar as "
-        "COPY FORWARD above): a genuinely NEW fact — a named wallet/"
-        "destination funds are moving to, or an official response/status "
-        "change — still gets reported even if the rest repeats; score "
-        "45-69 (70+ if funds are moving to a specific exchange, or the "
-        "official news is major like funds recovered/attacker caught). A "
-        "modestly revised loss estimate or a repeat with no new address/"
-        "official word does NOT meet this bar.\n\n"
-        "FIRST-MENTION PRIORITY — being the earliest signal of a brand-new "
-        "incident is this system's single most valuable output. If this "
-        "tweet matches NO case in 'Known open cases' AND recency judgment "
-        "says it's fresh ('within the last hour' or 'no earlier mention "
-        "found'), score at the TOP of whatever band it otherwise falls "
-        "in, even thin or unverified — vague-but-first beats detailed-"
-        "but-late."
+        "Is this tweet reporting that a crypto attack, hack, exploit or "
+        "security incident is happening RIGHT NOW? Tweets from trusted "
+        f"accounts score higher. Trusted: {trusted_list}.\n\n"
+        "Respond with ONLY valid JSON (no markdown):\n"
+        '{"is_real_incident": true/false, "risk_score": 0-100 (0-24 not an '
+        "incident, 25-44 plausible, 45-69 credible and unfolding, 70-100 "
+        'major and active), "case_key": "short_lowercase_underscore id of '
+        "the incident; if it matches one in 'Known open cases', copy that "
+        'key EXACTLY", "tokens_affected": "symbols or \'unknown\'", '
+        '"estimated_loss_usd": "e.g. \'~$3M\' or \'unknown\'", '
+        '"latest_official_response": "what the project/exchange said or '
+        'did, or \'unknown\'", "hacker_addresses": "addresses or '
+        '\'unknown\'", "asset_movement": "where stolen funds are moving, '
+        'or \'unknown\'", "status": "ongoing | contained | resolved | '
+        'unknown", "summary": "max 140 chars: \'<Project>: <what\'s '
+        'happening>\'"}'
     )
 
 
@@ -1223,22 +942,12 @@ def _parse_classification_json(text: str, provider: str):
 def classify_with_ai(tweet: dict):
     """
     Asks the AI to judge whether a tweet describes a real, currently-active
-    crypto security incident, assign a risk score, and — when using Grok
-    with live X search — verify how recently the incident actually started,
-    folding that directly into the score (fresher = higher, stale = lower).
-    This replaces the old two-step design (a separate scoring call, then a
-    separate pre-alert live-search recency check): now the SAME AI call
-    does both, as requested.
+    crypto security incident and assign a risk score. No live X search is
+    used (it was removed to cut cost), so there is no recency verification.
 
     Provider priority (first that succeeds wins):
-      1. Grok WITH live X search — best: classification + real recency
-         verification in one call. Used when XAI_API_KEY is set and
-         LIVE_SEARCH_RECENCY_CHECK is enabled (the default).
-      2. Claude — classification only, no live search (can't verify
-         recency, so it's told to not claim to).
-      3. Grok WITHOUT live search — last resort if the live-search call
-         itself failed (e.g. bad response shape) but the key is still
-         presumably valid for plain chat completions.
+      1. Grok — plain chat completion.
+      2. Claude — fallback if Grok is unconfigured or fails.
 
     Returns a dict (see _parse_classification_json() for the exact shape:
     score, label, summary, reasoning, first_seen, case_key, fields), or
@@ -1261,40 +970,28 @@ def classify_with_ai(tweet: dict):
         f"about one of these — see case_key instructions):\n{open_cases}"
     )
 
-    # 1. Grok + live X search (best — merged classification + recency).
-    if XAI_API_KEY and LIVE_SEARCH_RECENCY_CHECK:
-        system_prompt = _build_classification_prompt(trusted_list, has_live_search=True)
+    system_prompt = _build_classification_prompt(trusted_list)
+
+    # 1. Grok (primary).
+    if XAI_API_KEY:
         try:
-            text = _call_grok_responses_with_search(system_prompt, user_message, max_tokens=800)
-            result = _parse_classification_json(text, "grok (live search)")
+            text = _call_grok(system_prompt, user_message, max_tokens=700)
+            result = _parse_classification_json(text, "grok")
             if result:
                 return result
         except Exception as e:
-            print(f"Grok live-search classification failed, trying next "
-                  f"provider: {e}", file=sys.stderr)
+            print(f"Grok classification failed, trying next provider: {e}",
+                  file=sys.stderr)
 
-    # 2. Claude — classification only, no live search.
+    # 2. Claude (fallback).
     if ANTHROPIC_API_KEY:
-        system_prompt = _build_classification_prompt(trusted_list, has_live_search=False)
         try:
             text = _call_claude(system_prompt, user_message, max_tokens=700)
             result = _parse_classification_json(text, "claude")
             if result:
                 return result
         except Exception as e:
-            print(f"Claude classification failed, trying next provider: {e}",
-                  file=sys.stderr)
-
-    # 3. Grok without live search — last resort.
-    if XAI_API_KEY:
-        system_prompt = _build_classification_prompt(trusted_list, has_live_search=False)
-        try:
-            text = _call_grok(system_prompt, user_message, max_tokens=700)
-            result = _parse_classification_json(text, "grok (no search)")
-            if result:
-                return result
-        except Exception as e:
-            print(f"Grok (no search) classification failed: {e}", file=sys.stderr)
+            print(f"Claude classification failed: {e}", file=sys.stderr)
 
     print("AI classification failed: every configured provider was "
           "unreachable/erroring.", file=sys.stderr)
@@ -1747,27 +1444,12 @@ def main():
               "without at least one of these configured.", file=sys.stderr)
         sys.exit(1)
 
-    if LIVE_SEARCH_RECENCY_CHECK and XAI_API_KEY:
-        print(f"AI provider priority: 1) Grok ({GROK_LIVE_SEARCH_MODEL}) WITH live X "
-              f"search — classifies AND verifies recency in one call, folding "
-              f"how fresh the incident is directly into the risk score; "
-              + (f"2) Claude ({CLAUDE_MODEL}) as fallback (no live search); "
-                 if ANTHROPIC_API_KEY else "2) Claude NOT configured; ")
-              + f"3) Grok without search as last resort. Live search bills "
-              f"per post/profile fetched, separate from chat tokens, and "
-              f"only runs on candidate tweets your two search queries "
-              f"already pulled — not every tweet on X. Set "
-              f"LIVE_SEARCH_RECENCY_CHECK=false to disable it and always "
-              f"use plain classification instead.")
-    else:
-        print(
-            "AI provider priority: "
-            + (f"1) Claude ({CLAUDE_MODEL}); " if ANTHROPIC_API_KEY else "Claude NOT configured; ")
-            + (f"2) Grok ({GROK_MODEL}), no live search."
-               if XAI_API_KEY else "Grok NOT configured.")
-            + (" Live-search recency check is OFF." if not XAI_API_KEY
-               else " Live-search recency check is disabled (LIVE_SEARCH_RECENCY_CHECK=false).")
-        )
+    print(
+        "AI provider priority: "
+        + (f"1) Grok ({GROK_MODEL}); " if XAI_API_KEY else "Grok NOT configured; ")
+        + (f"2) Claude ({CLAUDE_MODEL}) as fallback." if ANTHROPIC_API_KEY else "Claude NOT configured.")
+        + " Live X search is removed."
+    )
 
     if REDIS_URL:
         if get_redis():
