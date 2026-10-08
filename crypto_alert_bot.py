@@ -55,7 +55,7 @@ INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "5"))
 # Minimum likes a tweet needs to trigger an alert. Applied client-side
 # after fetching — X's pay-per-use tier doesn't support engagement-based
 # query operators (min_faves), so this reduces alert noise, not read cost.
-MIN_ENGAGEMENT_FILTER = int(os.environ.get("MIN_ENGAGEMENT_FILTER", "5"))
+MIN_ENGAGEMENT_FILTER = int(os.environ.get("MIN_ENGAGEMENT_FILTER", "0"))
 
 # How long (hours) an alerted incident stays in memory for duplicate
 # detection. New reports of the same incident within this window get
@@ -814,19 +814,9 @@ def _search_one_query(query: str, since_id: str | None):
 
 def search_recent_tweets(since_id: str | None):
     """
-    Runs the X search query (build_queries()) every poll, merges and
-    dedupes the results by tweet ID, and reconciles a single since_id for
-    the next poll. Tweet IDs are Twitter Snowflake IDs, which are globally
-    time-ordered across all of Twitter regardless of which query matched —
-    so it's safe (and simplest) to use one shared since_id watermark, taken
-    as the max newest_id seen across both queries, for both queries on the
-    next poll.
-
-    Returns (tweets, newest_id, error_message) — same contract as before.
-    error_message is None on success (even with zero matches — that's a
-    normal quiet period). If EITHER query errors, that error is reported,
-    but results from the other query (if it succeeded) are still returned
-    and used, so one query having trouble doesn't blind the whole poll.
+    Runs the X search query (build_queries()) every poll and returns
+    (tweets, newest_id, error_message). error_message is None on success
+    (even with zero matches — that's a normal quiet period).
     """
     if not X_BEARER_TOKEN:
         print("ERROR: X_BEARER_TOKEN is not set.", file=sys.stderr)
@@ -1331,6 +1321,12 @@ def run_once(since_id):
 
         preview = tweet["text"][:80].replace("\n", " ")
 
+        # Cheap check FIRST so low-engagement tweets never cost an AI call.
+        if likes < MIN_ENGAGEMENT_FILTER:
+            print(f"  [not classified] {likes} likes @{tweet['username']}: {preview} "
+                  f"-> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
+            continue
+
         ai_result = classify_with_ai(tweet)
         if not ai_result:
             print(f"  [SKIPPED — AI unreachable] {likes} likes @{tweet['username']}: {preview}",
@@ -1352,14 +1348,11 @@ def run_once(since_id):
         print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
         if reasoning:
             print(f"    reasoning: {reasoning}")
-        print(f"    case: {case_key}")
 
-        if likes < MIN_ENGAGEMENT_FILTER:
-            print(f"    -> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
-            continue
         if score < MIN_RISK_SCORE_TO_TRACK:
             print(f"    -> skipped (below MIN_RISK_SCORE_TO_TRACK={MIN_RISK_SCORE_TO_TRACK})")
             continue
+        print(f"    case: {case_key}")
 
         # Safety net: collapse near-duplicate case_keys (see
         # resolve_case_key()) before persisting, in case the AI drifted to
@@ -1417,8 +1410,6 @@ def run_once(since_id):
             message = format_case_update_alert(tweet, score, label, case_key, changed_fields, fields)
 
         send_telegram_alert(message)
-        if summary:
-            remember_alert(summary)  # so future duplicates of this get suppressed
         print(f"    -> ALERT SENT")
         time.sleep(1)  # be gentle with Telegram's rate limits
 
