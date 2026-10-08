@@ -1268,7 +1268,7 @@ def run_self_test():
     summary = ai_result["summary"]
     reasoning = ai_result["reasoning"]
     print(f"Scored via AI: {label} {score}/100 — {reasoning} "
-          f"(first seen: {ai_result['first_seen']}, case: {ai_result['case_key']})")
+          f"(case: {ai_result['case_key']})")
 
     zh_text = translate_to_chinese(test_tweet["text"])
     message = "🧪 <b>SELF-TEST — not a real incident</b>\n\n" + format_alert(
@@ -1352,7 +1352,7 @@ def run_once(since_id):
         print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
         if reasoning:
             print(f"    reasoning: {reasoning}")
-        print(f"    first seen: {first_seen} | case: {case_key}")
+        print(f"    case: {case_key}")
 
         if likes < MIN_ENGAGEMENT_FILTER:
             print(f"    -> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
