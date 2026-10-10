@@ -614,23 +614,33 @@ def _call_claude(system_prompt: str, user_message: str, max_tokens: int) -> str:
 
 
 def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
-    """Calls xAI's Grok API. Raises on any failure — caller handles fallback."""
-    resp = requests.post(
-        "https://api.x.ai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {XAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROK_MODEL,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-        },
-        timeout=20,
-    )
+    """Calls xAI's Grok API. Retries on 429 (rate limit) with backoff, since
+    a burst of tweets in one poll can briefly exceed xAI's requests-per-minute
+    cap even when credits are fine. Raises on any other failure."""
+    payload = {
+        "model": GROK_MODEL,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(4):
+        resp = requests.post("https://api.x.ai/v1/chat/completions",
+                             headers=headers, json=payload, timeout=30)
+        if resp.status_code != 429 or attempt == 3:
+            break
+        try:
+            wait = float(resp.headers.get("Retry-After", ""))
+        except ValueError:
+            wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+        wait = min(max(wait, 1), 15)
+        print(f"Grok rate-limited (429), retrying in {wait:.0f}s...", file=sys.stderr)
+        time.sleep(wait)
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"].strip()
