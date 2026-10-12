@@ -174,7 +174,8 @@ def list_case_keys() -> list[str]:
 # for case_key reuse (see get_open_cases_context() below). Kept small so it
 # doesn't blow up the prompt, but wide enough to cover "this got tweeted
 # about by 10 different accounts within an hour" bursts.
-OPEN_CASES_CONTEXT_LIMIT = 20
+OPEN_CASES_CONTEXT_LIMIT = int(os.environ.get("OPEN_CASES_CONTEXT_LIMIT", "10"))
+OPEN_CASES_CONTEXT_HOURS = int(os.environ.get("OPEN_CASES_CONTEXT_HOURS", "24"))
 
 # Of those, only cases updated within this many hours get the FULL per-
 # field fact dump (needed for the "copy forward, don't restate" check —
@@ -222,26 +223,21 @@ def get_open_cases_context() -> str:
 
     cases = [c for c in (get_case(k) for k in case_keys) if c]
     cases.sort(key=lambda c: c.get("last_seen", ""), reverse=True)
-    cases = cases[:OPEN_CASES_CONTEXT_LIMIT]
 
+    # Keys only (no field dump) and only cases active recently: the AI just
+    # needs the names to reuse one. Everything else is handled in code.
     now = datetime.now(timezone.utc)
-    blocks = []
+    keys = []
     for c in cases:
-        header = f"- case_key=\"{c['case_key']}\" | {c.get('display_name', c['case_key'])}"
         try:
             age_hours = (now - datetime.fromisoformat(c.get("last_seen", ""))).total_seconds() / 3600
         except ValueError:
-            age_hours = None
-
-        if age_hours is not None and age_hours <= OPEN_CASES_FULL_DETAIL_HOURS:
-            field_lines = "\n".join(
-                f"    {f}: {c.get(f) or 'unknown'}" for f in CASE_TRACKED_FIELDS
-            )
-            blocks.append(f"{header}\n{field_lines}")
-        else:
-            blocks.append(f"{header} | status: {c.get('status') or 'unknown'} (older case — "
-                           f"full details omitted, not expected to get same-day updates)")
-    return "\n".join(blocks)
+            continue
+        if age_hours <= OPEN_CASES_CONTEXT_HOURS:
+            keys.append(c["case_key"])
+        if len(keys) >= OPEN_CASES_CONTEXT_LIMIT:
+            break
+    return ", ".join(keys) if keys else "(none yet)"
 
 
 # Fields we track structured facts in, beyond the free-text summary — these
@@ -365,25 +361,111 @@ def _case_field_changed(field: str, old_val: str, new_val: str) -> bool:
     return new_val != old_val  # status and anything else: exact match is fine
 
 
+# Wallet / tx-hash looking strings (0x..., bc1.../1.../3... BTC, long base58
+# like Solana) — pulled out of text so "new address" can be detected
+# objectively instead of by comparing the AI's wording.
+_ADDR_RE = re.compile(
+    r"0x[a-f0-9]{6,}"
+    r"|\b(?:bc1|[13])[a-z0-9]{25,60}\b"
+    r"|\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{32,}\b"
+)
+_AMOUNT_RE = re.compile(
+    r"(\$)?\s?(\d+(?:\.\d+)?)\s?(k|m|b|thousand|million|billion)?\s?"
+    r"(eth|btc|usdt|usdc|sol|bnb|trx|dai|usd|weth|wbtc|steth)?\b"
+)
+
+
+def _extract_facts(text: str) -> set[str]:
+    """Objective facts in a piece of text: wallet/tx strings and money
+    amounts (rounded to 2 significant digits, so '$20.1M' == '$20M').
+    Used to decide whether a reworded field carries anything NEW."""
+    t = (text or "").lower().replace(",", "")
+    facts = {m.group(0) for m in _ADDR_RE.finditer(t)}
+    t_no_addr = _ADDR_RE.sub(" ", t)
+    for m in _AMOUNT_RE.finditer(t_no_addr):
+        dollar, num, unit, sym = m.groups()
+        if not (dollar or unit or sym):
+            continue  # bare number, not money
+        try:
+            v = float(num) * _USD_UNIT_MULTIPLIERS.get(unit or "", 1)
+        except ValueError:
+            continue
+        if v > 0:
+            facts.add("amt:%.1e" % v)
+    return facts
+
+
+_STATUS_RANK = {"ongoing": 1, "active": 1, "contained": 2, "resolved": 3}
+
+
+def _status_rank(value: str) -> int:
+    v = (value or "").strip().lower()
+    for k, r in _STATUS_RANK.items():
+        if v.startswith(k):
+            return r
+    return 0
+
+
+# Narrative fields where a reworded repeat must NOT count as news.
+_CASE_FIELD_FACT_TYPE = {"asset_movement", "latest_official_response"}
+# Below this word-overlap with EVERY previously seen version, a fact-less
+# narrative is treated as a genuinely different statement.
+_CASE_FIELD_HISTORY_OVERLAP_THRESHOLD = 0.15
+
+
 def diff_case_fields(old_case: dict, new_fields: dict) -> list[str]:
     """
-    Compares new_fields (freshly extracted by the AI for this tweet)
-    against what's already stored for this case, and returns the list of
-    tracked field names that changed meaningfully. An empty list means
-    "nothing new" — the tweet is a repeat of what we already know.
+    Returns which tracked fields carry genuinely NEW information versus
+    everything already known for this case. Objective rules, not wording:
+      - status: only when it moves FORWARD (ongoing -> contained -> resolved).
+      - hacker_addresses / tokens_affected: only when a new item appears.
+      - asset_movement / latest_official_response: only when the text holds
+        a wallet/tx string or money amount not already seen in this case;
+        if it holds none, only when it is very different from every
+        earlier version. Rewording alone never counts.
+      - estimated_loss_usd: big (25%+) moves only (not alert-worthy anyway).
+    The baseline is the case's whole history (known_facts), not just the
+    last stored value, so wording that flips back and forth can't re-fire.
     """
     changed = []
+    known = set(old_case.get("known_facts", []))
+    history = old_case.get("history", {})
     for field in CASE_TRACKED_FIELDS:
         new_val = _normalize_case_field(new_fields.get(field, ""))
         old_val = _normalize_case_field(old_case.get(field, ""))
         if new_val in _CASE_FIELD_EMPTY_VALUES:
-            continue  # the AI didn't learn anything new for this field this time
+            continue
+        if field == "status":
+            if _status_rank(new_val) > _status_rank(old_val):
+                changed.append(field)
+            continue
         if old_val in _CASE_FIELD_EMPTY_VALUES:
-            changed.append(field)  # first time we've learned this field at all
+            changed.append(field)  # first time we learn this field
+            continue
+        if field in _CASE_FIELD_FACT_TYPE:
+            new_facts = _extract_facts(new_val)
+            if new_facts:
+                if new_facts - known:
+                    changed.append(field)
+                continue
+            versions = [old_val] + [_normalize_case_field(v) for v in history.get(field, [])]
+            if all(_case_overlap(v, new_val) < _CASE_FIELD_HISTORY_OVERLAP_THRESHOLD
+                   for v in versions):
+                changed.append(field)
             continue
         if _case_field_changed(field, old_val, new_val):
             changed.append(field)
     return changed
+
+
+def _case_overlap(a: str, b: str) -> float:
+    # 5-letter prefixes so spelling/tense variants match (unauthorized /
+    # unauthorised, confirmed / confirms).
+    wa = {w[:5] for w in _word_set(a)}
+    wb = {w[:5] for w in _word_set(b)}
+    if not wa or not wb:
+        return 0.0 if a != b else 1.0
+    return len(wa & wb) / len(wa | wb)
 
 
 # Words too generic to prove two case_keys are about the SAME incident —
@@ -573,8 +655,21 @@ def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str
         changed_fields = diff_case_fields(existing, fields)
         case = existing
         case["last_seen"] = now_iso
+        hist = case.setdefault("history", {})
         for f in changed_fields:
+            if case.get(f):
+                hist.setdefault(f, []).append(case[f])
+                hist[f] = hist[f][-5:]
             case[f] = fields.get(f, "") or ""
+
+    # Remember every concrete fact (wallet/tx strings, amounts) ever seen
+    # for this case — from the AI's fields AND the raw tweet text — so the
+    # same fact reworded later is never treated as news again.
+    known = set(case.get("known_facts", []))
+    for f in ("asset_movement", "latest_official_response", "hacker_addresses"):
+        known |= _extract_facts(fields.get(f, ""))
+    known |= {x for x in _extract_facts(tweet.get("text", "")) if not x.startswith("amt:")}
+    case["known_facts"] = sorted(known)[-300:]
 
     case["updates"].append({
         "time": now_iso,
@@ -975,7 +1070,7 @@ def classify_with_ai(tweet: dict):
     # 1. Grok (primary).
     if XAI_API_KEY:
         try:
-            text = _call_grok(system_prompt, user_message, max_tokens=700)
+            text = _call_grok(system_prompt, user_message, max_tokens=400)
             result = _parse_classification_json(text, "grok")
             if result:
                 return result
@@ -986,7 +1081,7 @@ def classify_with_ai(tweet: dict):
     # 2. Claude (fallback).
     if ANTHROPIC_API_KEY:
         try:
-            text = _call_claude(system_prompt, user_message, max_tokens=700)
+            text = _call_claude(system_prompt, user_message, max_tokens=400)
             result = _parse_classification_json(text, "claude")
             if result:
                 return result
@@ -1316,112 +1411,147 @@ def note_ai_failure_and_maybe_alert():
         _last_ai_failure_alert_at = now
 
 
+def tweet_already_processed(tweet_id: str) -> bool:
+    r = get_redis()
+    if not r:
+        return False
+    try:
+        return bool(r.exists(f"crypto_alert_bot:seen:{tweet_id}"))
+    except Exception:
+        return False
+
+
+def mark_tweet_processed(tweet_id: str):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.set(f"crypto_alert_bot:seen:{tweet_id}", "1", ex=3 * 24 * 3600)
+    except Exception:
+        pass
+
+
+def _process_tweet(tweet: dict):
+    metrics = tweet.get("metrics", {})
+    likes = metrics.get("like_count", 0)
+
+    # Resolve any 'chain:0xaddress' references to readable token
+    # symbols before this text is used anywhere downstream.
+    tweet["text"] = resolve_token_symbols(tweet["text"])
+
+    preview = tweet["text"][:80].replace("\n", " ")
+
+    # Cheap check FIRST so low-engagement tweets never cost an AI call.
+    if likes < MIN_ENGAGEMENT_FILTER:
+        print(f"  [not classified] {likes} likes @{tweet['username']}: {preview} "
+              f"-> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
+        return
+
+    if tweet_already_processed(tweet["id"]):
+        return  # already classified earlier (e.g. batch re-fetched after an error)
+
+    ai_result = classify_with_ai(tweet)
+    if not ai_result:
+        print(f"  [SKIPPED — AI unreachable] {likes} likes @{tweet['username']}: {preview}",
+              file=sys.stderr)
+        note_ai_failure_and_maybe_alert()
+        return
+
+    mark_tweet_processed(tweet["id"])
+
+    score = ai_result["score"]
+    label = ai_result["label"]
+    summary = ai_result["summary"]
+    reasoning = ai_result["reasoning"]
+    first_seen = ai_result["first_seen"]
+    case_key = ai_result["case_key"]
+    fields = ai_result["fields"]
+
+    # Always log the score, even for tweets that won't alert — this is
+    # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
+    # MIN_ENGAGEMENT_FILTER against real traffic.
+    print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
+    if reasoning:
+        print(f"    reasoning: {reasoning}")
+
+    if score < MIN_RISK_SCORE_TO_TRACK:
+        print(f"    -> skipped (below MIN_RISK_SCORE_TO_TRACK={MIN_RISK_SCORE_TO_TRACK})")
+        return
+    print(f"    case: {case_key}")
+
+    # Safety net: collapse near-duplicate case_keys (see
+    # resolve_case_key()) before persisting, in case the AI drifted to
+    # a variant of an existing case instead of reusing it exactly.
+    resolved_key = resolve_case_key(case_key, tweet["text"])
+    if resolved_key != case_key:
+        print(f"    -> merged into existing case '{resolved_key}' "
+              f"(AI proposed '{case_key}')")
+        case_key = resolved_key
+
+    # Persistent case tracking: has this exact incident (by case_key)
+    # been recorded before, and if so, did THIS tweet add anything we
+    # didn't already know? This runs for anything clearing
+    # MIN_RISK_SCORE_TO_TRACK, which is lower than the alert bar — so a
+    # weak/early tweet still gets recorded even when it won't page you,
+    # giving a later tweet about the same case earlier context to
+    # build on. Always updates the case record either way; only the
+    # alert itself is gated further below.
+    is_new_case, changed_fields = upsert_case(
+        case_key, tweet, score, label, summary, fields, first_seen
+    )
+    if not is_new_case and not changed_fields:
+        print(f"    -> skipped (case '{case_key}' already known, no new "
+              f"information in this tweet — recorded to case history anyway)")
+        return
+
+    # For an UPDATE to a known case (not its first alert), only re-alert
+    # if something in ALERT_WORTHY_UPDATE_FIELDS changed. A rising loss
+    # estimate or a reworded status on an incident you already know
+    # about isn't worth another Telegram ping — what actually matters
+    # for an already-known hack is where the funds are moving and who's
+    # holding them, so those are what re-trigger an alert. Anything
+    # else that changed is still saved to the case record (for
+    # case_report.py) — it just doesn't page you again.
+    if not is_new_case:
+        alert_worthy_changes = [f for f in changed_fields if f in ALERT_WORTHY_UPDATE_FIELDS]
+        if not alert_worthy_changes:
+            print(f"    -> tracked but not re-alerted (case '{case_key}' updated "
+                  f"in {', '.join(changed_fields)}, none of which are in "
+                  f"ALERT_WORTHY_UPDATE_FIELDS={sorted(ALERT_WORTHY_UPDATE_FIELDS)})")
+            return
+        changed_fields = alert_worthy_changes
+
+    if score < MIN_RISK_SCORE_TO_ALERT:
+        print(f"    -> tracked but not alerted (below MIN_RISK_SCORE_TO_ALERT="
+              f"{MIN_RISK_SCORE_TO_ALERT}) — case '{case_key}' updated silently")
+        return
+
+    if is_new_case:
+        zh_text = translate_to_chinese(tweet["text"])
+        message = format_alert(tweet, score, label, zh_text, summary)
+    else:
+        pretty_fields = ", ".join(f.replace("_", " ") for f in changed_fields)
+        print(f"    -> case update: new info in {pretty_fields}")
+        message = format_case_update_alert(tweet, score, label, case_key, changed_fields, fields)
+
+    send_telegram_alert(message)
+    print(f"    -> ALERT SENT")
+    time.sleep(1)  # be gentle with Telegram's rate limits
+
+
 def run_once(since_id):
     tweets, newest_id, error = search_recent_tweets(since_id)
     if tweets:
         print(f"[{datetime.now(timezone.utc).isoformat()}] {len(tweets)} new candidate tweet(s).")
 
     for tweet in tweets:
-        metrics = tweet.get("metrics", {})
-        likes = metrics.get("like_count", 0)
-
-        # Resolve any 'chain:0xaddress' references to readable token
-        # symbols before this text is used anywhere downstream.
-        tweet["text"] = resolve_token_symbols(tweet["text"])
-
-        preview = tweet["text"][:80].replace("\n", " ")
-
-        # Cheap check FIRST so low-engagement tweets never cost an AI call.
-        if likes < MIN_ENGAGEMENT_FILTER:
-            print(f"  [not classified] {likes} likes @{tweet['username']}: {preview} "
-                  f"-> skipped (below MIN_ENGAGEMENT_FILTER={MIN_ENGAGEMENT_FILTER})")
-            continue
-
-        ai_result = classify_with_ai(tweet)
-        if not ai_result:
-            print(f"  [SKIPPED — AI unreachable] {likes} likes @{tweet['username']}: {preview}",
-                  file=sys.stderr)
-            note_ai_failure_and_maybe_alert()
-            continue
-
-        score = ai_result["score"]
-        label = ai_result["label"]
-        summary = ai_result["summary"]
-        reasoning = ai_result["reasoning"]
-        first_seen = ai_result["first_seen"]
-        case_key = ai_result["case_key"]
-        fields = ai_result["fields"]
-
-        # Always log the score, even for tweets that won't alert — this is
-        # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
-        # MIN_ENGAGEMENT_FILTER against real traffic.
-        print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
-        if reasoning:
-            print(f"    reasoning: {reasoning}")
-
-        if score < MIN_RISK_SCORE_TO_TRACK:
-            print(f"    -> skipped (below MIN_RISK_SCORE_TO_TRACK={MIN_RISK_SCORE_TO_TRACK})")
-            continue
-        print(f"    case: {case_key}")
-
-        # Safety net: collapse near-duplicate case_keys (see
-        # resolve_case_key()) before persisting, in case the AI drifted to
-        # a variant of an existing case instead of reusing it exactly.
-        resolved_key = resolve_case_key(case_key, tweet["text"])
-        if resolved_key != case_key:
-            print(f"    -> merged into existing case '{resolved_key}' "
-                  f"(AI proposed '{case_key}')")
-            case_key = resolved_key
-
-        # Persistent case tracking: has this exact incident (by case_key)
-        # been recorded before, and if so, did THIS tweet add anything we
-        # didn't already know? This runs for anything clearing
-        # MIN_RISK_SCORE_TO_TRACK, which is lower than the alert bar — so a
-        # weak/early tweet still gets recorded even when it won't page you,
-        # giving a later tweet about the same case earlier context to
-        # build on. Always updates the case record either way; only the
-        # alert itself is gated further below.
-        is_new_case, changed_fields = upsert_case(
-            case_key, tweet, score, label, summary, fields, first_seen
-        )
-        if not is_new_case and not changed_fields:
-            print(f"    -> skipped (case '{case_key}' already known, no new "
-                  f"information in this tweet — recorded to case history anyway)")
-            continue
-
-        # For an UPDATE to a known case (not its first alert), only re-alert
-        # if something in ALERT_WORTHY_UPDATE_FIELDS changed. A rising loss
-        # estimate or a reworded status on an incident you already know
-        # about isn't worth another Telegram ping — what actually matters
-        # for an already-known hack is where the funds are moving and who's
-        # holding them, so those are what re-trigger an alert. Anything
-        # else that changed is still saved to the case record (for
-        # case_report.py) — it just doesn't page you again.
-        if not is_new_case:
-            alert_worthy_changes = [f for f in changed_fields if f in ALERT_WORTHY_UPDATE_FIELDS]
-            if not alert_worthy_changes:
-                print(f"    -> tracked but not re-alerted (case '{case_key}' updated "
-                      f"in {', '.join(changed_fields)}, none of which are in "
-                      f"ALERT_WORTHY_UPDATE_FIELDS={sorted(ALERT_WORTHY_UPDATE_FIELDS)})")
-                continue
-            changed_fields = alert_worthy_changes
-
-        if score < MIN_RISK_SCORE_TO_ALERT:
-            print(f"    -> tracked but not alerted (below MIN_RISK_SCORE_TO_ALERT="
-                  f"{MIN_RISK_SCORE_TO_ALERT}) — case '{case_key}' updated silently")
-            continue
-
-        if is_new_case:
-            zh_text = translate_to_chinese(tweet["text"])
-            message = format_alert(tweet, score, label, zh_text, summary)
-        else:
-            pretty_fields = ", ".join(f.replace("_", " ") for f in changed_fields)
-            print(f"    -> case update: new info in {pretty_fields}")
-            message = format_case_update_alert(tweet, score, label, case_key, changed_fields, fields)
-
-        send_telegram_alert(message)
-        print(f"    -> ALERT SENT")
-        time.sleep(1)  # be gentle with Telegram's rate limits
+        try:
+            _process_tweet(tweet)
+        except Exception as e:
+            # One bad tweet must not abort the batch: if run_once raised,
+            # since_id would not advance and the whole batch would be
+            # fetched and re-processed next poll.
+            print(f"Error processing tweet {tweet.get('id')}: {e}", file=sys.stderr)
 
     return newest_id, error
 
