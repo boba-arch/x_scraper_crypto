@@ -19,6 +19,7 @@ setup described in SETUP_GUIDE.md):
     # Find and delete case keys with no distinctive keyword (junk):
     railway run python merge_cases.py junk
     railway run python merge_cases.py delete <key> [<key> ...]   (add --dry-run to preview)
+    railway run python merge_cases.py delete --junk              (delete ALL junk keys)
 
     # Step 2 — merge them. The FIRST case_key you list is the one that
     # survives (the "keep" key) — all the others are folded into it and
@@ -178,9 +179,14 @@ def main():
         return
 
     if args[0] == "delete":
-        keys = [a for a in args[1:] if a != "--dry-run"]
+        keys = [a for a in args[1:] if a not in ("--dry-run", "--junk", "--all")]
+        if "--all" in args:  # delete EVERY case
+            keys = bot.list_case_keys()
+            print(f"--all: {len(keys)} case(s) selected.")
+        if "--junk" in args:  # delete every junk key in one go
+            keys += [k for k in bot.list_case_keys() if not bot._key_words(k)]
         if not keys:
-            print("ERROR: give at least one case_key to delete.", file=sys.stderr)
+            print("ERROR: give at least one case_key to delete (or --all).", file=sys.stderr)
             sys.exit(1)
         r = bot.get_redis()
         for k in keys:
