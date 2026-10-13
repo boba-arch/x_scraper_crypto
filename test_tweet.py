@@ -10,6 +10,11 @@ Or from the Railway shell (`railway ssh`):
 
     python test_tweet.py "tweet text here"
 
+You can also pass a link to the tweet instead of its text (the bot fetches the
+text and author from X; this costs one tweet read on your X API plan):
+
+    railway run python test_tweet.py https://x.com/FuturesWire/status/1234567890
+
 Optional: pretend the tweet came from a particular account:
 
     python test_tweet.py "tweet text here" --user peckshieldalert
@@ -19,9 +24,41 @@ it under, the extracted fields, and whether it would be tracked / alerted
 with your current thresholds.
 """
 
+import re
 import sys
 
+import requests
+
 import crypto_alert_bot as bot
+
+
+def fetch_tweet(url: str):
+    """Returns (text, username) for an x.com / twitter.com status link."""
+    m = re.search(r"/status/(\d+)", url)
+    if not m:
+        print("ERROR: couldn't find a tweet ID in that link.", file=sys.stderr)
+        sys.exit(1)
+    if not bot.X_BEARER_TOKEN:
+        print("ERROR: X_BEARER_TOKEN isn't set — run via `railway run`.", file=sys.stderr)
+        sys.exit(1)
+    resp = requests.get(
+        f"https://api.twitter.com/2/tweets/{m.group(1)}",
+        headers={"Authorization": f"Bearer {bot.X_BEARER_TOKEN}"},
+        params={"tweet.fields": "text,note_tweet,author_id",
+                "expansions": "author_id", "user.fields": "username"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        print(f"ERROR: X API returned {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+    data = resp.json()
+    if "data" not in data:
+        print(f"ERROR: tweet not found or not visible: {str(data)[:200]}", file=sys.stderr)
+        sys.exit(1)
+    tw = data["data"]
+    text = (tw.get("note_tweet") or {}).get("text") or tw["text"]  # note_tweet = full text of long posts
+    users = data.get("includes", {}).get("users", [])
+    return text, (users[0]["username"] if users else "unknown")
 
 
 def main():
@@ -39,6 +76,11 @@ def main():
     if not text:
         print(__doc__)
         sys.exit(1)
+    if re.match(r"https?://(www\.)?(x|twitter)\.com/", text):
+        text, author = fetch_tweet(text)
+        if username == "test_account":
+            username = author
+        print(f"Fetched tweet by @{author}:\n{text}\n")
     if not bot.XAI_API_KEY:
         print("ERROR: XAI_API_KEY isn't set — run this through `railway run` "
               "or `railway ssh`.", file=sys.stderr)
