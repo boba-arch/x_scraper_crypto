@@ -736,7 +736,10 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
         wait = min(max(wait, 1), 15)
         print(f"Grok rate-limited (429), retrying in {wait:.0f}s...", file=sys.stderr)
         time.sleep(wait)
-    resp.raise_for_status()
+    if not resp.ok:
+        # Include xAI's own explanation (e.g. spending limit reached, key
+        # lacks access to the model) — the bare status code hides it.
+        raise RuntimeError(f"{resp.status_code} from xAI: {resp.text[:300]}")
     data = resp.json()
     return data["choices"][0]["message"]["content"].strip()
 
