@@ -36,12 +36,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recommended
 
-# AI scoring uses Grok as the primary provider, with automatic failover to
-# Claude if Grok is unreachable/erroring — you only get paged on Telegram if
-# BOTH fail. Set whichever key(s) you have; at least one is required.
-XAI_API_KEY = os.environ.get("XAI_API_KEY")  # primary provider (Grok)
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # fallback provider (Claude)
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+# AI scoring uses Grok only (xAI). XAI_API_KEY is required.
+XAI_API_KEY = os.environ.get("XAI_API_KEY")
 GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
@@ -57,45 +53,12 @@ INITIAL_LOOKBACK_MINUTES = int(os.environ.get("INITIAL_LOOKBACK_MINUTES", "5"))
 # query operators (min_faves), so this reduces alert noise, not read cost.
 MIN_ENGAGEMENT_FILTER = int(os.environ.get("MIN_ENGAGEMENT_FILTER", "0"))
 
-# How long (hours) an alerted incident stays in memory for duplicate
-# detection. New reports of the same incident within this window get
-# suppressed by the AI unless they add genuinely new information.
-DEDUPE_WINDOW_HOURS = float(os.environ.get("DEDUPE_WINDOW_HOURS", "12"))
-DEDUPE_MAX_ENTRIES = int(os.environ.get("DEDUPE_MAX_ENTRIES", "10"))  # cap memory size regardless of window
-
-# In-memory record of recently alerted incidents, so the AI can recognize
-# "this is the same story another account already told me about" instead
-# of re-alerting every time a different account tweets the same news.
-# Resets on restart — same caveat as since_id.
-recent_alerts: list[dict] = []
-
-def remember_alert(summary: str):
-    recent_alerts.append({"time": datetime.now(timezone.utc), "summary": summary})
-    prune_recent_alerts()
-
-
-def prune_recent_alerts():
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=DEDUPE_WINDOW_HOURS)
-    while recent_alerts and recent_alerts[0]["time"] < cutoff:
-        recent_alerts.pop(0)
-    while len(recent_alerts) > DEDUPE_MAX_ENTRIES:
-        recent_alerts.pop(0)
-
-
-def recent_alerts_context() -> str:
-    prune_recent_alerts()
-    if not recent_alerts:
-        return "(none yet)"
-    return "\n".join(f"- {a['summary']}" for a in recent_alerts)
-
-
 # ---------------------------------------------------------------------------
 # Persistent case store (Redis) — one structured record per incident,
-# keyed by the AI's own "case_key" (e.g. "egld_multiversx_exploit"). Unlike
-# recent_alerts above (short-term, in-memory, resets on restart), this is
-# meant to last: it survives restarts/redeploys and has no fixed retention
-# window, so "have we already told the risk officer about this incident"
-# can be answered days or weeks later, not just within a few hours.
+# keyed by a short "case_key" made of up to 3 distinctive keywords (e.g.
+# "ledger_cryptobilis_asia"). It survives restarts/redeploys and has no fixed
+# retention window, so "have we already told the risk officer about this
+# incident" can be answered days or weeks later.
 #
 # Only active when REDIS_URL is set (a free Railway Redis add-on works
 # fine). Without it, the bot still runs exactly as before — no case
@@ -170,50 +133,16 @@ def list_case_keys() -> list[str]:
     return sorted(r.smembers(CASE_INDEX_KEY))
 
 
-# How many of the most-recently-updated cases to show the AI as candidates
-# for case_key reuse (see get_open_cases_context() below). Kept small so it
-# doesn't blow up the prompt, but wide enough to cover "this got tweeted
-# about by 10 different accounts within an hour" bursts.
+# The AI is shown the keys of recently-active cases so it can reuse one for a
+# tweet about the same incident. Keys only (no field dump) keeps this cheap.
 OPEN_CASES_CONTEXT_LIMIT = int(os.environ.get("OPEN_CASES_CONTEXT_LIMIT", "10"))
 OPEN_CASES_CONTEXT_HOURS = int(os.environ.get("OPEN_CASES_CONTEXT_HOURS", "24"))
 
-# Of those, only cases updated within this many hours get the FULL per-
-# field fact dump (needed for the "copy forward, don't restate" check —
-# see get_open_cases_context()). Older cases are very unlikely to get a
-# genuine repeat tweet, so they only need their case_key + status shown
-# (still enough for case_key-reuse matching) rather than all 6 tracked
-# fields — this is what keeps prompt size (and therefore per-call cost)
-# from scaling with total cases ever tracked instead of just active ones.
-OPEN_CASES_FULL_DETAIL_HOURS = 48
-
 
 def get_open_cases_context() -> str:
-    """
-    Returns a compact, per-case text block describing the most-recently-
-    updated known cases — fed to the AI classifier for TWO purposes:
-
-    1. So it can REUSE an existing case_key for a tweet about an incident
-       it already knows, instead of inventing a new one blind. Without
-       this, every call is stateless and the AI has no way to know what
-       an incident was already named, which is what caused the same
-       real-world incident to fragment into many different case_keys
-       (e.g. "cosmos_hub_noble_exploit", "cosmos_hub_neutron_attack",
-       "cosmos_hub_governance_exploit", ...). Every case in the list gets
-       at least this — a one-line case_key/display_name/status entry.
-
-    2. So it can tell whether THIS tweet actually adds a new fact versus
-       just rewording something already on file — but only for cases
-       updated in the last OPEN_CASES_FULL_DETAIL_HOURS, which get their
-       CURRENT tracked field values shown in full so the AI can compare
-       the tweet's content against them directly and copy a value
-       forward unchanged when nothing substantive has changed (see the
-       "COPY FORWARD, DON'T RESTATE" prompt instructions). A case that's
-       gone quiet for days is very unlikely to get a genuine same-day
-       repeat, so it doesn't need this — keeping the prompt from growing
-       with your total case history instead of just what's currently hot.
-
-    Returns "(none yet)" if case tracking is off or no cases exist yet.
-    """
+    """Comma-separated case_keys of cases active in the last
+    OPEN_CASES_CONTEXT_HOURS (max OPEN_CASES_CONTEXT_LIMIT), newest first,
+    fed to the classifier so it can reuse a key. "(none yet)" if empty."""
     r = get_redis()
     if not r:
         return "(none yet)"
@@ -275,20 +204,6 @@ def _normalize_case_field(value: str) -> str:
 # something not already known), not as exact strings.
 _CASE_FIELD_LIST_TYPE = {"tokens_affected", "hacker_addresses"}
 
-# estimated_loss_usd/latest_official_response/asset_movement are free-text
-# narrative the AI writes fresh every call — the SAME fact routinely comes
-# back reworded ("~$20M" vs "$20 million estimated", "paused, investigating"
-# vs "investigation ongoing"), which exact-string comparison mistakes for
-# new information, firing a repeat "CASE UPDATE" alert for nothing. These
-# are compared by text similarity instead, and only count as changed once
-# the wording diverges enough to plausibly be a different fact, not just a
-# different phrasing of the same one.
-_CASE_FIELD_FUZZY_TYPE = {
-    "estimated_loss_usd", "latest_official_response", "asset_movement",
-}
-# Below this word-overlap ratio, two versions of a narrative field are
-# treated as different facts rather than a reworded repeat of the same one.
-_CASE_FIELD_WORD_OVERLAP_THRESHOLD = 0.3
 # A new loss estimate only counts as "changed" once it moves more than this
 # fraction away from the old one — small re-estimates ($19.8M -> $20.1M)
 # are noise, not new information.
@@ -334,11 +249,10 @@ def _word_set(text: str) -> set[str]:
 
 
 def _case_field_changed(field: str, old_val: str, new_val: str) -> bool:
-    """True if new_val represents genuinely new information for `field`
-    versus old_val (both already lowercased/stripped), using a comparison
-    suited to that field's shape rather than blind exact-string equality
-    (the AI reworks free-text fields every call, so exact matching treats
-    a rephrasing of the same fact as new information)."""
+    """For the fields not handled by the fact / status rules in
+    diff_case_fields(): list fields change when an item is added; the loss
+    estimate changes when it moves more than 25%. Both values are already
+    lowercased/stripped."""
     if field in _CASE_FIELD_LIST_TYPE:
         old_set = {v.strip() for v in old_val.split(",") if v.strip()}
         new_set = {v.strip() for v in new_val.split(",") if v.strip()}
@@ -349,16 +263,9 @@ def _case_field_changed(field: str, old_val: str, new_val: str) -> bool:
         new_amount = _extract_usd_amount(new_val)
         if old_amount and new_amount:
             return abs(new_amount - old_amount) / old_amount > _CASE_FIELD_USD_TOLERANCE
-        # no parseable number on one side — fall through to word overlap
+        return False  # can't compare; loss revisions aren't news anyway
 
-    if field in _CASE_FIELD_FUZZY_TYPE:
-        old_words, new_words = _word_set(old_val), _word_set(new_val)
-        if not old_words or not new_words:
-            return new_val != old_val
-        overlap = len(old_words & new_words) / len(old_words | new_words)
-        return overlap < _CASE_FIELD_WORD_OVERLAP_THRESHOLD
-
-    return new_val != old_val  # status and anything else: exact match is fine
+    return new_val != old_val
 
 
 # Wallet / tx-hash looking strings (0x..., bc1.../1.../3... BTC, long base58
@@ -468,164 +375,133 @@ def _case_overlap(a: str, b: str) -> float:
     return len(wa & wb) / len(wa | wb)
 
 
-# Words too generic to prove two case_keys are about the SAME incident —
-# stripped out before comparing, so "cosmos_hub_governance_exploit" and
-# "cosmos_hub_validators_halt" are still recognized as sharing "cosmos"/
-# "hub" even though neither incident-type word matches.
-_CASE_KEY_STOPWORDS = {
-    "exploit", "exploited", "hack", "hacked", "hacker", "incident",
-    "attack", "attacked", "breach", "breached", "halt", "halted",
-    "halting", "suspended", "paused", "frozen", "vulnerability",
-    "governance", "validators", "validator", "network", "chain",
-    "protocol", "unknown", "token", "tokens", "security", "issue",
+# Words that can never be a case's identity: incident-report boilerplate and
+# very common asset/market words. A case_key is built from the OTHER words —
+# the project, company, attacker, victim or place — and two keys describe the
+# same incident when they share one of those.
+_GENERIC_WORDS = {
+    # incident boilerplate
+    "exploit", "exploited", "hack", "hacked", "hacker", "hackers", "incident",
+    "attack", "attacked", "attacker", "attackers", "breach", "breached",
+    "halt", "halted", "halting", "suspended", "paused", "frozen",
+    "vulnerability", "governance", "validators", "validator", "network",
+    "chain", "protocol", "unknown", "token", "tokens", "security", "issue",
+    "supply", "stolen", "drained", "compromised", "phishing", "scam",
+    "breaking", "update", "alert", "report", "reports", "reported",
+    "confirmed", "confirms", "official", "urgent", "just", "today", "now",
+    "according", "sources", "amid", "major", "massive", "huge", "new",
+    "another", "latest", "multiple", "several", "users", "wallet", "wallets",
+    "funds", "million", "billion", "this", "that", "with", "from", "warning",
+    "caution", "news", "investigating", "investigation", "unauthorized", "peg", "withdrawals", "withdrawal", "deposits", "bridge",
+    "unauthorised", "implant", "backend", "spoofing", "the", "and", "for",
+    # very common market words
+    "crypto", "bitcoin", "ethereum", "solana", "btc", "eth", "sol", "usdt",
+    "usdc", "defi", "web3", "exchange", "blockchain", "mainnet", "dex",
+    "bnb", "bsc", "nft", "dao",
 }
 
-# How far back (in hours) to look for a case to merge a near-duplicate
-# case_key into. Long enough to catch an incident that keeps getting
-# re-reported over a few days, short enough not to merge into stale,
-# long-resolved cases that happen to share a project name.
+CASE_KEY_MAX_WORDS = 3
+
+# How far back to look for a case to fold a new tweet into. Long enough to
+# catch an incident re-reported over several days, short enough not to merge
+# into long-resolved cases that merely share a project name.
 CASE_MERGE_LOOKBACK_HOURS = 24 * 7
 
 
-def _case_key_tokens(case_key: str) -> set[str]:
-    """Distinctive (non-generic) tokens in a case_key, used to detect
-    near-duplicate case_keys for the same real-world incident."""
-    return {
-        t for t in case_key.split("_")
-        if t not in _CASE_KEY_STOPWORDS and not t.isdigit() and len(t) > 2
-    }
-
-
-# Words too generic/incident-y to serve as a case's own identity when
-# minting a fallback case_key straight from tweet text (see
-# _fallback_case_key_from_text()). Deliberately overlaps _CASE_KEY_STOPWORDS
-# but includes plain-English words too, since this runs on raw tweet prose
-# rather than an already-terse case_key.
-_FALLBACK_NAME_IGNORE = _CASE_KEY_STOPWORDS | {
-    "breaking", "update", "alert", "report", "reports", "reported",
-    "confirmed", "official", "urgent", "just", "today", "now", "crypto",
-    "the", "backend", "spoofing", "according", "sources", "amid",
-}
-
-
-def _fallback_case_key_from_text(tweet_text: str, existing_keys: set[str]) -> str:
-    """
-    Mints a brand-new case_key straight from a tweet's own text, used when
-    the AI's proposed case_key turns out to belong to an unrelated case
-    (see resolve_case_key()) and no better existing match was found. Picks
-    the first capitalized word/phrase in the tweet that isn't generic
-    incident-report boilerplate — usually the project/exchange name — e.g.
-    "Bitget Breach: $387.5M Stolen..." -> "bitget_incident_2026_09".
-    Falls back to "unknown_incident_<month>" if nothing usable is found,
-    and disambiguates with a numeric suffix if that key is already taken.
-    """
-    base = None
-    for m in re.findall(r"\b[A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z][a-zA-Z0-9]{2,}){0,2}\b", tweet_text):
-        slug = "_".join(w.lower() for w in m.split())
-        if slug in _FALLBACK_NAME_IGNORE:
+def _key_words(case_key: str) -> list[str]:
+    """Distinctive words of a case_key, in order, without repeats."""
+    seen, out = set(), []
+    for w in (case_key or "").lower().split("_"):
+        if w in seen or w in _GENERIC_WORDS or w.isdigit() or len(w) < 3:
             continue
-        base = slug
-        break
-    base = base or "unknown"
+        seen.add(w)
+        out.append(w)
+    return out
 
-    month_suffix = datetime.now(timezone.utc).strftime("%Y_%m")
-    key = f"{base}_incident_{month_suffix}"
-    n = 2
-    while key in existing_keys:
-        key = f"{base}_incident_{month_suffix}_{n}"
+
+def _words_from_text(tweet_text: str) -> list[str]:
+    """Last-resort key words taken from the tweet itself: its capitalised
+    names and $TICKERS that aren't generic, first CASE_KEY_MAX_WORDS."""
+    out = []
+    for m in re.findall(r"\$?\b[A-Za-z][A-Za-z0-9]{2,}\b", tweet_text):
+        if not (m[0].isupper() or m[0] == "$"):
+            continue
+        w = m.lstrip("$").lower()
+        if w in _GENERIC_WORDS or w in out or w.isdigit():
+            continue
+        out.append(w)
+        if len(out) >= CASE_KEY_MAX_WORDS:
+            break
+    return out
+
+
+def resolve_case_key(candidate_key: str, tweet_text: str = "", tweet_id: str = "") -> str:
+    """
+    Turns the AI's proposed case_key into the key this tweet is filed under.
+
+    1. If it is an existing case and the tweet mentions one of its keywords,
+       use it as is. (An existing key whose keywords the tweet never mentions
+       is a wrong reuse — it is rejected.)
+    2. Otherwise keep only the proposed keywords that literally appear in the
+       tweet (max 3) — this drops invented or generic words. If none are
+       left, take names from the tweet text instead.
+    3. If any of those words is shared with a case active in the last 7
+       days, file the tweet under that case (earliest one wins) — this joins
+       the Ledger tweets that say "ledger" with those that say "ledger
+       cryptobilis".
+    4. Otherwise it is a new case keyed by those words.
+    """
+    r = get_redis()
+    text_lower = (tweet_text or "").lower()
+    existing_keys = set(list_case_keys()) if r else set()
+
+    if candidate_key in existing_keys:
+        words = _key_words(candidate_key)
+        if not tweet_text or not words or any(w in text_lower for w in words):
+            return candidate_key
+        print(f"    -> case_key sanity check failed: AI proposed reusing "
+              f"'{candidate_key}' but the tweet mentions none of its keywords "
+              f"({', '.join(words)}) — treating it as a different incident.",
+              file=sys.stderr)
+
+    words = _key_words(candidate_key)
+    if tweet_text:
+        words = [w for w in words if w in text_lower]
+        if not words:
+            words = _words_from_text(tweet_text)
+    words = words[:CASE_KEY_MAX_WORDS]
+
+    if r and words:
+        now = datetime.now(timezone.utc)
+        best = None  # (first_seen_iso, case_key)
+        for key in existing_keys:
+            if not set(words) & set(_key_words(key)):
+                continue
+            case = get_case(key)
+            if not case:
+                continue
+            try:
+                age_h = (now - datetime.fromisoformat(case.get("last_seen", ""))).total_seconds() / 3600
+            except ValueError:
+                continue
+            if age_h > CASE_MERGE_LOOKBACK_HOURS:
+                continue
+            first = case.get("first_seen") or case.get("last_seen", "")
+            if best is None or first < best[0]:
+                best = (first, key)
+        if best:
+            return best[1]
+
+    key = "_".join(words) if words else f"unknown_{(tweet_id or 'x')[-6:]}"
+    base, n = key, 2
+    while key in existing_keys:  # only reachable for a rejected reuse
+        key = f"{base}_{n}"
         n += 1
     return key
 
 
-def resolve_case_key(candidate_key: str, tweet_text: str = "") -> str:
-    """
-    Safety net for case_key mistakes in both directions.
-
-    1. FRAGMENTATION: the AI is shown a list of known open cases and told
-       to copy a matching case_key exactly, but free-text generation means
-       it sometimes drifts to a near-duplicate variant anyway — e.g. the
-       same Cosmos Hub/Neutron incident got tagged 'cosmos_hub_noble_exploit',
-       'cosmos_hub_neutron_attack', and 'cosmos_hub_governance_exploit'
-       across different tweets. Distinctive-token overlap with a recently-
-       active case collapses these into one canonical (earliest) case.
-
-    2. WRONG MERGE (the more dangerous direction): the AI sometimes reuses
-       an EXISTING case_key for a genuinely different incident — e.g. a
-       tweet about a Bitget breach got filed under an existing
-       'bybit_safe_delegatecall_exploit_2026_09' case just because both
-       had a similar loss figure, silently corrupting the real Bybit case
-       with unrelated Bitget data. To catch this, any reuse of an existing
-       case_key (whether it's an exact match or a token-overlap merge) is
-       only accepted if the tweet text actually mentions something
-       distinctive about that case. If the AI's exact case_key fails this
-       check and nothing else matches either, a fresh case_key is minted
-       straight from the tweet's own text (see _fallback_case_key_from_text)
-       instead of corrupting the wrong case.
-
-    Only affects NEW classifications going forward — existing fragmented
-    or wrongly-merged case records are left as-is (not fixed retroactively).
-    """
-    r = get_redis()
-    if not r:
-        return candidate_key
-
-    text_lower = tweet_text.lower()
-
-    def _mentions(key: str) -> bool:
-        tokens = _case_key_tokens(key)
-        return not tokens or any(t in text_lower for t in tokens)
-
-    existing_keys = set(list_case_keys())
-    existing = get_case(candidate_key)
-    if existing:
-        if not tweet_text or _mentions(candidate_key):
-            return candidate_key  # exact match, and the tweet backs it up
-        print(f"    -> case_key sanity check failed: AI proposed reusing "
-              f"'{candidate_key}' but this tweet doesn't mention any of its "
-              f"distinctive terms — likely a different incident (e.g. a "
-              f"similarly-named project or a coincidentally matching loss "
-              f"figure). Looking for the real match instead.", file=sys.stderr)
-
-    candidate_tokens = _case_key_tokens(candidate_key)
-    now = datetime.now(timezone.utc)
-    best_match = None  # (first_seen_iso, case_key)
-    for key in existing_keys:
-        if key == candidate_key:
-            continue
-        case = get_case(key)
-        if not case:
-            continue
-        try:
-            age_hours = (now - datetime.fromisoformat(case.get("last_seen", ""))).total_seconds() / 3600
-        except ValueError:
-            continue
-        if age_hours > CASE_MERGE_LOOKBACK_HOURS:
-            continue
-        if not (candidate_tokens & _case_key_tokens(key)):
-            continue
-        # Token overlap with the candidate alone isn't enough evidence on
-        # its own (the candidate could itself be the wrong case) — the
-        # tweet has to actually back up THIS case too.
-        if tweet_text and not _mentions(key):
-            continue
-        first_seen = case.get("first_seen") or case.get("last_seen", "")
-        if best_match is None or first_seen < best_match[0]:
-            best_match = (first_seen, key)
-
-    if best_match:
-        return best_match[1]
-
-    if existing:
-        # candidate_key belongs to a different, unrelated case (sanity
-        # check above failed) and nothing else matched either — don't
-        # corrupt that case; give this tweet its own fresh identity.
-        return _fallback_case_key_from_text(tweet_text, existing_keys)
-
-    return candidate_key
-
-
 def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str,
-                 fields: dict, first_seen_estimate: str) -> tuple[bool, list[str]]:
+                 fields: dict) -> tuple[bool, list[str]]:
     """
     Creates or updates the persistent record for case_key with this tweet's
     info. Returns (is_new_case, changed_fields) — is_new_case is True the
@@ -678,34 +554,11 @@ def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str
         "score": score,
         "label": label,
         "summary": summary,
-        "first_seen_estimate": first_seen_estimate,
     })
     case["updates"] = case["updates"][-CASE_MAX_UPDATES_STORED:]
 
     save_case(case_key, case)
     return is_new, changed_fields
-
-
-def _call_claude(system_prompt: str, user_message: str, max_tokens: int) -> str:
-    """Calls Anthropic's Claude API. Raises on any failure — caller handles fallback."""
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": CLAUDE_MODEL,
-            "max_tokens": max_tokens,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_message}],
-        },
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["content"][0]["text"].strip()
 
 
 def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
@@ -921,39 +774,13 @@ def _search_one_query(query: str, since_id: str | None):
 
 
 def search_recent_tweets(since_id: str | None):
-    """
-    Runs the X search query (build_queries()) every poll and returns
-    (tweets, newest_id, error_message). error_message is None on success
-    (even with zero matches — that's a normal quiet period).
-    """
+    """Runs the single X search query. Returns (tweets, newest_id,
+    error_message); error_message is None on success (even with zero
+    matches — a quiet period is normal)."""
     if not X_BEARER_TOKEN:
         print("ERROR: X_BEARER_TOKEN is not set.", file=sys.stderr)
         sys.exit(1)
-
-    queries = build_queries()
-    combined_by_id: dict[str, dict] = {}
-    newest_id = since_id
-    errors = []
-
-    for i, query in enumerate(queries, start=1):
-        tweets, q_newest_id, error = _search_one_query(query, since_id)
-        if error:
-            print(f"Query {i} of {len(queries)} failed: {error}", file=sys.stderr)
-            errors.append(error)
-        for t in tweets:
-            combined_by_id[t["id"]] = t  # dedupe by tweet ID
-        # Numeric comparison — Snowflake IDs are time-ordered but can exceed
-        # 64-bit-safe float precision, so compare as int, not string/lexical.
-        if q_newest_id and (newest_id is None or int(q_newest_id) > int(newest_id)):
-            newest_id = q_newest_id
-
-    # Only treat this as a hard failure if EVERY query failed with no
-    # results at all — a partial failure still yields usable tweets.
-    error_message = None
-    if errors and not combined_by_id:
-        error_message = errors[0]
-
-    return list(combined_by_id.values()), newest_id, error_message
+    return _search_one_query(build_queries()[0], since_id)
 
 
 def _build_classification_prompt(trusted_list: str) -> str:
@@ -964,9 +791,12 @@ def _build_classification_prompt(trusted_list: str) -> str:
         "Respond with ONLY valid JSON (no markdown):\n"
         '{"is_real_incident": true/false, "risk_score": 0-100 (0-24 not an '
         "incident, 25-44 plausible, 45-69 credible and unfolding, 70-100 "
-        'major and active), "case_key": "short_lowercase_underscore id of '
-        "the incident; if it matches one in 'Known open cases', copy that "
-        'key EXACTLY", "tokens_affected": "symbols or \'unknown\'", '
+        'major and active), "case_key": "if this is about a case in Known '
+        "open cases, copy its key EXACTLY; otherwise up to 3 distinctive "
+        "lowercase words from the tweet joined by _ (project/company, plus "
+        "attacker, victim or place if named; never generic words like hack, "
+        'exploit, incident, supply, wallet, crypto, and no dates)", '
+        '"tokens_affected": "symbols or \'unknown\'", '
         '"estimated_loss_usd": "e.g. \'~$3M\' or \'unknown\'", '
         '"latest_official_response": "what the project/exchange said or '
         'did, or \'unknown\'", "hacker_addresses": "addresses or '
@@ -981,7 +811,7 @@ def _parse_classification_json(text: str, provider: str):
     """
     Shared JSON parsing/repair for classify_with_ai()'s response, used by
     every provider attempt. Returns a dict with keys: score, label,
-    summary, reasoning, first_seen, case_key, fields (a dict of
+    summary, case_key, fields (a dict of
     CASE_TRACKED_FIELDS values) — or None if the response couldn't be
     parsed into a usable classification.
     """
@@ -1010,8 +840,6 @@ def _parse_classification_json(text: str, provider: str):
             # Safety net in case the AI overshoots the 140-char instruction —
             # trim on a word boundary rather than mid-word.
             summary = summary[:140].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
-        reasoning = parsed.get("reasoning", "").strip()
-        first_seen = parsed.get("first_seen_estimate", "unknown").strip()
         case_key = (parsed.get("case_key", "") or "").strip().lower().replace(" ", "_") or "unknown_incident"
         fields = {f: (parsed.get(f, "") or "").strip() for f in CASE_TRACKED_FIELDS}
         if not is_real:
@@ -1027,7 +855,6 @@ def _parse_classification_json(text: str, provider: str):
             label = "LOW"
         return {
             "score": score, "label": label, "summary": summary,
-            "reasoning": reasoning, "first_seen": first_seen,
             "case_key": case_key, "fields": fields,
         }
 
@@ -1039,22 +866,14 @@ def _parse_classification_json(text: str, provider: str):
 
 def classify_with_ai(tweet: dict):
     """
-    Asks the AI to judge whether a tweet describes a real, currently-active
-    crypto security incident and assign a risk score. No live X search is
-    used (it was removed to cut cost), so there is no recency verification.
-
-    Provider priority (first that succeeds wins):
-      1. Grok — plain chat completion.
-      2. Claude — fallback if Grok is unconfigured or fails.
-
-    Returns a dict (see _parse_classification_json() for the exact shape:
-    score, label, summary, reasoning, first_seen, case_key, fields), or
-    None if AI scoring isn't configured or every provider's call fails.
-    There is no keyword-based fallback — scoring is AI-only, so callers
-    should skip the tweet and page on Telegram when this returns None (see
+    Asks Grok whether a tweet reports a real, currently-active crypto
+    security incident and assigns a risk score (see
+    _parse_classification_json() for the returned dict). Returns None if
+    XAI_API_KEY is missing or the call fails — scoring is AI-only, so the
+    caller skips the tweet and pages on Telegram (see
     note_ai_failure_and_maybe_alert()).
     """
-    if not ANTHROPIC_API_KEY and not XAI_API_KEY:
+    if not XAI_API_KEY:
         return None
 
     username = tweet.get("username", "unknown")
@@ -1070,30 +889,12 @@ def classify_with_ai(tweet: dict):
 
     system_prompt = _build_classification_prompt(trusted_list)
 
-    # 1. Grok (primary).
-    if XAI_API_KEY:
-        try:
-            text = _call_grok(system_prompt, user_message, max_tokens=400)
-            result = _parse_classification_json(text, "grok")
-            if result:
-                return result
-        except Exception as e:
-            print(f"Grok classification failed, trying next provider: {e}",
-                  file=sys.stderr)
-
-    # 2. Claude (fallback).
-    if ANTHROPIC_API_KEY:
-        try:
-            text = _call_claude(system_prompt, user_message, max_tokens=400)
-            result = _parse_classification_json(text, "claude")
-            if result:
-                return result
-        except Exception as e:
-            print(f"Claude classification failed: {e}", file=sys.stderr)
-
-    print("AI classification failed: every configured provider was "
-          "unreachable/erroring.", file=sys.stderr)
-    return None
+    try:
+        text = _call_grok(system_prompt, user_message, max_tokens=400)
+        return _parse_classification_json(text, "grok")
+    except Exception as e:
+        print(f"Grok classification failed: {e}", file=sys.stderr)
+        return None
 
 
 # Maps how X writes chain names in "chain:0xaddress" references to the
@@ -1351,22 +1152,15 @@ def run_self_test():
 
     ai_result = classify_with_ai(test_tweet)
     if not ai_result:
-        print("AI classification failed — both Claude and Grok were unreachable/"
-              "erroring, or neither is configured. Scoring is AI-only now, so no "
-              "alert can be sent. Check ANTHROPIC_API_KEY / XAI_API_KEY.",
-              file=sys.stderr)
-        send_system_alert(
-            "Self-test: AI classification failed on both Claude and Grok. "
-            "Scoring is AI-only — check ANTHROPIC_API_KEY / XAI_API_KEY."
-        )
+        print("AI classification failed — Grok was unreachable/erroring or "
+              "isn't configured. Check XAI_API_KEY.", file=sys.stderr)
+        send_system_alert("Self-test: AI classification failed. Check XAI_API_KEY.")
         return
 
     score = ai_result["score"]
     label = ai_result["label"]
     summary = ai_result["summary"]
-    reasoning = ai_result["reasoning"]
-    print(f"Scored via AI: {label} {score}/100 — {reasoning} "
-          f"(case: {ai_result['case_key']})")
+    print(f"Scored via AI: {label} {score}/100 (case: {ai_result['case_key']})")
 
     zh_text = translate_to_chinese(test_tweet["text"])
     message = "🧪 <b>SELF-TEST — not a real incident</b>\n\n" + format_alert(
@@ -1405,11 +1199,10 @@ def note_ai_failure_and_maybe_alert():
     )
     if cooldown_elapsed:
         send_system_alert(
-            "AI classification is unreachable or failing on BOTH Claude and "
-            "Grok (or neither is configured). Scoring is AI-only — tweets "
-            "are being SKIPPED (not keyword-scored) until this recovers, so "
-            "you may be missing real incidents right now. Check "
-            "ANTHROPIC_API_KEY / XAI_API_KEY."
+            "Grok classification is failing (or XAI_API_KEY is missing). "
+            "Scoring is AI-only — tweets are being SKIPPED until this "
+            "recovers, so you may be missing real incidents right now. "
+            "Check XAI_API_KEY, the xAI spending limit and the bot logs."
         )
         _last_ai_failure_alert_at = now
 
@@ -1465,8 +1258,6 @@ def _process_tweet(tweet: dict):
     score = ai_result["score"]
     label = ai_result["label"]
     summary = ai_result["summary"]
-    reasoning = ai_result["reasoning"]
-    first_seen = ai_result["first_seen"]
     case_key = ai_result["case_key"]
     fields = ai_result["fields"]
 
@@ -1474,22 +1265,17 @@ def _process_tweet(tweet: dict):
     # what you want to watch to calibrate MIN_RISK_SCORE_TO_ALERT and
     # MIN_ENGAGEMENT_FILTER against real traffic.
     print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
-    if reasoning:
-        print(f"    reasoning: {reasoning}")
 
     if score < MIN_RISK_SCORE_TO_TRACK:
         print(f"    -> skipped (below MIN_RISK_SCORE_TO_TRACK={MIN_RISK_SCORE_TO_TRACK})")
         return
-    print(f"    case: {case_key}")
 
-    # Safety net: collapse near-duplicate case_keys (see
-    # resolve_case_key()) before persisting, in case the AI drifted to
-    # a variant of an existing case instead of reusing it exactly.
-    resolved_key = resolve_case_key(case_key, tweet["text"])
-    if resolved_key != case_key:
-        print(f"    -> merged into existing case '{resolved_key}' "
-              f"(AI proposed '{case_key}')")
-        case_key = resolved_key
+    # File the tweet under the right case (see resolve_case_key()): reuse an
+    # existing case that shares a distinctive keyword, else a new keyword key.
+    resolved_key = resolve_case_key(case_key, tweet["text"], tweet["id"])
+    note = f" (AI proposed '{case_key}')" if resolved_key != case_key else ""
+    print(f"    case: {resolved_key}{note}")
+    case_key = resolved_key
 
     # Persistent case tracking: has this exact incident (by case_key)
     # been recorded before, and if so, did THIS tweet add anything we
@@ -1500,7 +1286,7 @@ def _process_tweet(tweet: dict):
     # build on. Always updates the case record either way; only the
     # alert itself is gated further below.
     is_new_case, changed_fields = upsert_case(
-        case_key, tweet, score, label, summary, fields, first_seen
+        case_key, tweet, score, label, summary, fields
     )
     if not is_new_case and not changed_fields:
         print(f"    -> skipped (case '{case_key}' already known, no new "
@@ -1572,18 +1358,12 @@ def main():
               "TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.", file=sys.stderr)
         sys.exit(1)
 
-    if not ANTHROPIC_API_KEY and not XAI_API_KEY:
-        print("ERROR: Neither ANTHROPIC_API_KEY nor XAI_API_KEY is set. "
-              "Scoring is AI-only — the bot cannot classify any tweets "
-              "without at least one of these configured.", file=sys.stderr)
+    if not XAI_API_KEY:
+        print("ERROR: XAI_API_KEY is not set. Scoring is AI-only — the bot "
+              "cannot classify tweets without it.", file=sys.stderr)
         sys.exit(1)
 
-    print(
-        "AI provider priority: "
-        + (f"1) Grok ({GROK_MODEL}); " if XAI_API_KEY else "Grok NOT configured; ")
-        + (f"2) Claude ({CLAUDE_MODEL}) as fallback." if ANTHROPIC_API_KEY else "Claude NOT configured.")
-        + " Live X search is removed."
-    )
+    print(f"AI: Grok ({GROK_MODEL}). No live X search, no fallback provider.")
 
     if REDIS_URL:
         if get_redis():

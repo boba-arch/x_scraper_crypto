@@ -68,15 +68,13 @@ def format_case_list(cases: list[dict]) -> str:
 
 def generate_full_report(case: dict) -> str:
     """
-    Asks the AI (Claude primary, Grok fallback — same providers as the main
-    bot) to synthesize this case's full structured record + update history
+    Asks Grok (same provider as the main bot) to synthesize this case's full structured record + update history
     into a readable status report. Returns the AI's text, or a plain
-    fallback dump of the raw data if both providers fail.
+    dump of the raw data if Grok fails.
     """
     updates_text = "\n".join(
         f"[{u['time'][:16].replace('T', ' ')} UTC] (@{u['username']}, "
         f"{u['label']} {u['score']}) {u['summary']}"
-        + (f" (first seen: {u['first_seen_estimate']})" if u.get("first_seen_estimate") else "")
         for u in case.get("updates", [])
     )
     fields_text = "\n".join(
@@ -110,18 +108,13 @@ def generate_full_report(case: dict) -> str:
         f"Update history ({len(case.get('updates', []))} entries):\n{updates_text}"
     )
 
-    if bot.ANTHROPIC_API_KEY:
-        try:
-            return bot._call_claude(system_prompt, user_message, max_tokens=700)
-        except Exception as e:
-            print(f"Claude report generation failed, trying Grok: {e}", file=sys.stderr)
     if bot.XAI_API_KEY:
         try:
             return bot._call_grok(system_prompt, user_message, max_tokens=700)
         except Exception as e:
             print(f"Grok report generation failed: {e}", file=sys.stderr)
 
-    # Both failed (or neither configured) — fall back to the raw data
+    # Grok failed (or isn't configured) — fall back to the raw data
     # rather than sending nothing.
     return (
         "(AI report generation unavailable — showing raw data instead)\n\n"
