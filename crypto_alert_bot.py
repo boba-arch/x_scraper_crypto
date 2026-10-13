@@ -890,7 +890,7 @@ def classify_with_ai(tweet: dict):
     system_prompt = _build_classification_prompt(trusted_list)
 
     try:
-        text = _call_grok(system_prompt, user_message, max_tokens=400)
+        text = _call_grok(system_prompt, user_message, max_tokens=200)
         return _parse_classification_json(text, "grok")
     except Exception as e:
         print(f"Grok classification failed: {e}", file=sys.stderr)
