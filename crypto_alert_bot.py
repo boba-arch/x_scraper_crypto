@@ -39,6 +39,9 @@ DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recomme
 # AI scoring uses Grok only (xAI). XAI_API_KEY is required.
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
+GROK_TIMEOUT_SECONDS = int(os.environ.get("GROK_TIMEOUT_SECONDS", "40"))   # per request
+GROK_TOTAL_BUDGET_SECONDS = int(os.environ.get("GROK_TOTAL_BUDGET_SECONDS", "75"))  # per tweet, all retries
+GROK_MIN_INTERVAL_SECONDS = float(os.environ.get("GROK_MIN_INTERVAL_SECONDS", "1.0"))  # between calls
 
 # How often to poll, in seconds. 30-60s gives near-real-time alerts without
 # hammering X's rate limit (450 search requests / 15 min per app).
@@ -561,10 +564,16 @@ def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str
     return is_new, changed_fields
 
 
+_last_grok_call_at = 0.0
+
+
 def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
-    """Calls xAI's Grok API. Retries on 429 (rate limit) with backoff, since
-    a burst of tweets in one poll can briefly exceed xAI's requests-per-minute
-    cap even when credits are fine. Raises on any other failure."""
+    """Calls xAI's Grok API. Calls are spaced at least GROK_MIN_INTERVAL_SECONDS
+    apart (a batch of tweets would otherwise burst into xAI's rate limit).
+    Retries on rate limits (429), server errors (5xx), timeouts and dropped
+    connections, but gives up after GROK_TOTAL_BUDGET_SECONDS in total so one
+    bad moment at xAI can't freeze the poll loop. Raises on failure."""
+    global _last_grok_call_at
     payload = {
         "model": GROK_MODEL,
         "max_tokens": max_tokens,
@@ -577,24 +586,37 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
     }
+    deadline = time.time() + GROK_TOTAL_BUDGET_SECONDS
+    last_error = "unknown"
     for attempt in range(4):
-        resp = requests.post("https://api.x.ai/v1/chat/completions",
-                             headers=headers, json=payload, timeout=30)
-        if resp.status_code != 429 or attempt == 3:
-            break
+        gap = GROK_MIN_INTERVAL_SECONDS - (time.time() - _last_grok_call_at)
+        if gap > 0:
+            time.sleep(gap)
+        _last_grok_call_at = time.time()
+        wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
         try:
-            wait = float(resp.headers.get("Retry-After", ""))
-        except ValueError:
-            wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+            resp = requests.post("https://api.x.ai/v1/chat/completions", headers=headers,
+                                 json=payload, timeout=GROK_TIMEOUT_SECONDS)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_error = type(e).__name__
+        else:
+            if resp.ok:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            # Include xAI's own explanation (spend limit, blocked key, content
+            # filter...) — the bare status code hides it.
+            last_error = f"{resp.status_code} from xAI: {resp.text[:300]}"
+            if resp.status_code != 429 and resp.status_code < 500:
+                raise RuntimeError(last_error)  # not worth retrying
+            try:
+                wait = float(resp.headers.get("Retry-After", ""))
+            except ValueError:
+                pass
         wait = min(max(wait, 1), 15)
-        print(f"Grok rate-limited (429), retrying in {wait:.0f}s...", file=sys.stderr)
+        if attempt == 3 or time.time() + wait > deadline:
+            break
+        print(f"Grok {last_error[:60]} — retrying in {wait:.0f}s ({attempt + 1}/3)...", file=sys.stderr)
         time.sleep(wait)
-    if not resp.ok:
-        # Include xAI's own explanation (e.g. spending limit reached, key
-        # lacks access to the model) — the bare status code hides it.
-        raise RuntimeError(f"{resp.status_code} from xAI: {resp.text[:300]}")
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+    raise RuntimeError(f"gave up after retries: {last_error}")
 
 
 
@@ -890,7 +912,7 @@ def classify_with_ai(tweet: dict):
     system_prompt = _build_classification_prompt(trusted_list)
 
     try:
-        text = _call_grok(system_prompt, user_message, max_tokens=200)
+        text = _call_grok(system_prompt, user_message, max_tokens=400)
         return _parse_classification_json(text, "grok")
     except Exception as e:
         print(f"Grok classification failed: {e}", file=sys.stderr)
@@ -1207,7 +1229,14 @@ def note_ai_failure_and_maybe_alert():
         _last_ai_failure_alert_at = now
 
 
+_seen_local: set[str] = set()  # fallback when Redis is off / briefly down
+AI_MAX_ATTEMPTS_PER_TWEET = 3
+_ai_fail_counts: dict[str, int] = {}
+
+
 def tweet_already_processed(tweet_id: str) -> bool:
+    if tweet_id in _seen_local:
+        return True
     r = get_redis()
     if not r:
         return False
@@ -1218,6 +1247,9 @@ def tweet_already_processed(tweet_id: str) -> bool:
 
 
 def mark_tweet_processed(tweet_id: str):
+    if len(_seen_local) > 5000:
+        _seen_local.clear()
+    _seen_local.add(tweet_id)
     r = get_redis()
     if not r:
         return
@@ -1227,7 +1259,9 @@ def mark_tweet_processed(tweet_id: str):
         pass
 
 
-def _process_tweet(tweet: dict):
+def _process_tweet(tweet: dict) -> bool:
+    """Handles one tweet. Returns True only if the AI call failed and the
+    tweet should be retried on a later poll."""
     metrics = tweet.get("metrics", {})
     likes = metrics.get("like_count", 0)
 
@@ -1248,10 +1282,17 @@ def _process_tweet(tweet: dict):
 
     ai_result = classify_with_ai(tweet)
     if not ai_result:
-        print(f"  [SKIPPED — AI unreachable] {likes} likes @{tweet['username']}: {preview}",
-              file=sys.stderr)
+        n = _ai_fail_counts.get(tweet["id"], 0) + 1
+        _ai_fail_counts[tweet["id"]] = n
         note_ai_failure_and_maybe_alert()
-        return
+        if n >= AI_MAX_ATTEMPTS_PER_TWEET:
+            print(f"  [GAVE UP after {n} failed AI attempts] {likes} likes "
+                  f"@{tweet['username']}: {preview}", file=sys.stderr)
+            mark_tweet_processed(tweet["id"])
+            return False
+        print(f"  [AI failed, will retry next poll ({n}/{AI_MAX_ATTEMPTS_PER_TWEET})] "
+              f"{likes} likes @{tweet['username']}: {preview}", file=sys.stderr)
+        return True  # retry later
 
     mark_tweet_processed(tweet["id"])
 
@@ -1333,14 +1374,31 @@ def run_once(since_id):
     if tweets:
         print(f"[{datetime.now(timezone.utc).isoformat()}] {len(tweets)} new candidate tweet(s).")
 
+    retry_needed = False
+    consecutive_ai_failures = 0
     for tweet in tweets:
+        if consecutive_ai_failures >= 2:
+            # xAI is clearly struggling — stop hammering it this poll; the
+            # untouched tweets are picked up again next poll.
+            retry_needed = True
+            break
         try:
-            _process_tweet(tweet)
+            failed = _process_tweet(tweet)
         except Exception as e:
-            # One bad tweet must not abort the batch: if run_once raised,
-            # since_id would not advance and the whole batch would be
-            # fetched and re-processed next poll.
+            # One bad tweet must not abort the batch.
             print(f"Error processing tweet {tweet.get('id')}: {e}", file=sys.stderr)
+            failed = False
+        if failed:
+            retry_needed = True
+            consecutive_ai_failures += 1
+        else:
+            consecutive_ai_failures = 0
+
+    if retry_needed:
+        # Don't advance past tweets we couldn't classify: next poll re-fetches
+        # them. Tweets already classified are skipped for free (seen-ID check),
+        # and a tweet is abandoned after AI_MAX_ATTEMPTS_PER_TWEET failures.
+        return since_id, error
 
     return newest_id, error
 
