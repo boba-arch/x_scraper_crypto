@@ -39,6 +39,9 @@ DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recomme
 # AI scoring uses Grok only (xAI). XAI_API_KEY is required.
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
+# Optional second Grok model, used only when GROK_MODEL is overloaded ("at
+# capacity", 5xx, timeouts). Leave unset to disable.
+GROK_FALLBACK_MODEL = os.environ.get("GROK_FALLBACK_MODEL", "")
 GROK_TIMEOUT_SECONDS = int(os.environ.get("GROK_TIMEOUT_SECONDS", "40"))   # per request
 GROK_TOTAL_BUDGET_SECONDS = int(os.environ.get("GROK_TOTAL_BUDGET_SECONDS", "75"))  # per tweet, all retries
 GROK_MIN_INTERVAL_SECONDS = float(os.environ.get("GROK_MIN_INTERVAL_SECONDS", "1.0"))  # between calls
@@ -567,15 +570,18 @@ def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str
 _last_grok_call_at = 0.0
 
 
-def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
+def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
+               model: str | None = None, fast_fail: bool = False) -> str:
     """Calls xAI's Grok API. Calls are spaced at least GROK_MIN_INTERVAL_SECONDS
     apart (a batch of tweets would otherwise burst into xAI's rate limit).
     Retries on rate limits (429), server errors (5xx), timeouts and dropped
     connections, but gives up after GROK_TOTAL_BUDGET_SECONDS in total so one
-    bad moment at xAI can't freeze the poll loop. Raises on failure."""
+    bad moment at xAI can't freeze the poll loop. With fast_fail, an
+    "at capacity" 429 raises at once so the caller can switch models.
+    Raises on failure."""
     global _last_grok_call_at
     payload = {
-        "model": GROK_MODEL,
+        "model": model or GROK_MODEL,
         "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -607,6 +613,8 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int) -> str:
             last_error = f"{resp.status_code} from xAI: {resp.text[:300]}"
             if resp.status_code != 429 and resp.status_code < 500:
                 raise RuntimeError(last_error)  # not worth retrying
+            if fast_fail and "capacity" in resp.text.lower():
+                raise RuntimeError(last_error)  # overloaded model: switch instead of waiting
             try:
                 wait = float(resp.headers.get("Retry-After", ""))
             except ValueError:
@@ -886,6 +894,9 @@ def _parse_classification_json(text: str, provider: str):
         return None
 
 
+_last_ai_error = ""  # newest Grok failure text, shown in the Telegram health alert
+
+
 def classify_with_ai(tweet: dict):
     """
     Asks Grok whether a tweet reports a real, currently-active crypto
@@ -911,12 +922,17 @@ def classify_with_ai(tweet: dict):
 
     system_prompt = _build_classification_prompt(trusted_list)
 
-    try:
-        text = _call_grok(system_prompt, user_message, max_tokens=400)
-        return _parse_classification_json(text, "grok")
-    except Exception as e:
-        print(f"Grok classification failed: {e}", file=sys.stderr)
-        return None
+    models = [GROK_MODEL] + ([GROK_FALLBACK_MODEL] if GROK_FALLBACK_MODEL else [])
+    for i, model in enumerate(models):
+        try:
+            text = _call_grok(system_prompt, user_message, max_tokens=400, model=model,
+                              fast_fail=(i == 0 and len(models) > 1))
+            return _parse_classification_json(text, f"grok ({model})")
+        except Exception as e:
+            global _last_ai_error
+            _last_ai_error = str(e)
+            print(f"Grok ({model}) classification failed: {e}", file=sys.stderr)
+    return None
 
 
 # Maps how X writes chain names in "chain:0xaddress" references to the
@@ -1202,14 +1218,29 @@ def send_system_alert(message: str):
     send_telegram_alert(full_message)
 
 
-# Scoring is AI-only — no keyword-based fallback. classify_with_ai()
-# already tries every configured provider in priority order before giving
-# up; this only fires once ALL of them have failed. Tweets during that
-# window are skipped (not silently keyword-scored) and you're paged on
-# Telegram instead, cooldown-guarded so a stuck outage doesn't spam you
-# once per tweet.
+# Scoring is AI-only — no keyword-based fallback. When Grok (and the optional
+# fallback model) fail, you're paged on Telegram with xAI's own error message
+# (in English and Chinese), cooldown-guarded so a stuck outage doesn't spam
+# you once per tweet.
 _last_ai_failure_alert_at = None
 AI_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
+
+
+def _readable_ai_error(raw: str) -> str:
+    """xAI's own message out of a raw error string like
+    'gave up after retries: 429 from xAI: {"code":"...","error":"The model..."}'."""
+    m = re.search(r"\{.*\}", raw or "", flags=re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            msg = data.get("error") or data.get("message")
+            if isinstance(msg, dict):
+                msg = msg.get("message")
+            if msg:
+                return str(msg).strip()
+        except Exception:
+            pass
+    return (raw or "unknown error").strip()[:300]
 
 
 def note_ai_failure_and_maybe_alert():
@@ -1220,17 +1251,19 @@ def note_ai_failure_and_maybe_alert():
         or (now - _last_ai_failure_alert_at).total_seconds() > AI_FAILURE_ALERT_COOLDOWN_SECONDS
     )
     if cooldown_elapsed:
+        reason = _readable_ai_error(_last_ai_error)
         send_system_alert(
-            "Grok classification is failing (or XAI_API_KEY is missing). "
-            "Scoring is AI-only — tweets are being SKIPPED until this "
-            "recovers, so you may be missing real incidents right now. "
-            "Check XAI_API_KEY, the xAI spending limit and the bot logs."
+            "Grok classification is failing. Tweets are queued and retried "
+            f"for about {AI_MAX_ATTEMPTS_PER_TWEET} polls, then dropped, so you "
+            "may miss incidents until this recovers.\n\n"
+            f"<b>xAI says:</b> {html.escape(reason)}\n\n"
+            f"<b>xAI 提示：</b> {html.escape(translate_to_chinese(reason))}"
         )
         _last_ai_failure_alert_at = now
 
 
 _seen_local: set[str] = set()  # fallback when Redis is off / briefly down
-AI_MAX_ATTEMPTS_PER_TWEET = 3
+AI_MAX_ATTEMPTS_PER_TWEET = int(os.environ.get("AI_MAX_ATTEMPTS_PER_TWEET", "6"))  # polls, not calls
 _ai_fail_counts: dict[str, int] = {}
 
 
@@ -1421,7 +1454,9 @@ def main():
               "cannot classify tweets without it.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"AI: Grok ({GROK_MODEL}). No live X search, no fallback provider.")
+    print(f"AI: Grok ({GROK_MODEL})"
+          + (f", fallback model {GROK_FALLBACK_MODEL}" if GROK_FALLBACK_MODEL else "")
+          + ". No live X search.")
 
     if REDIS_URL:
         if get_redis():
