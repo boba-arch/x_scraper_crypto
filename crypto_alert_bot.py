@@ -1262,6 +1262,187 @@ def note_ai_failure_and_maybe_alert():
         _last_ai_failure_alert_at = now
 
 
+# ---------------------------------------------------------------------------
+# Telegram "dampener" — temporarily hard-mute a word from your Telegram chat:
+#   /dampen pyr 6h        mute "pyr" for 6 hours (m / h / d; default 6h)
+#   /dampen "ledger implant" 2d   (quote a phrase)
+#   /undampen pyr         cancel early
+#   /dampened             list active mutes
+# A tweet containing a muted word (whole word, case-insensitive; "$PYR" counts)
+# is skipped BEFORE the Grok call, so it costs nothing. Only messages from
+# TELEGRAM_CHAT_ID are obeyed. Mutes live in Redis with an expiry (lost on
+# restart if Redis is off). Commands are read once per poll (~45s).
+# ---------------------------------------------------------------------------
+
+MUTE_MAX_SECONDS = 7 * 24 * 3600
+MUTE_DEFAULT_SECONDS = 6 * 3600
+MUTE_KEY_PREFIX = "crypto_alert_bot:mute:"
+TG_OFFSET_KEY = "crypto_alert_bot:tg_offset"
+BOT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Jakarta")
+
+_mutes_local: dict[str, datetime] = {}  # word -> expiry (used when Redis is off)
+_tg_offset = None  # next Telegram update id to read
+_tg_warned = False
+
+
+def _fmt_local(dt: datetime) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo(BOT_TIMEZONE)).strftime("%d %b %H:%M") + f" {BOT_TIMEZONE}"
+    except Exception:
+        return dt.strftime("%d %b %H:%M") + " UTC"
+
+
+def _fmt_remaining(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{max(1, seconds // 60)}m"
+
+
+def add_mute(word: str, seconds: int) -> datetime:
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    _mutes_local[word] = expiry
+    r = get_redis()
+    if r:
+        try:
+            r.set(MUTE_KEY_PREFIX + word, expiry.isoformat(), ex=seconds)
+        except Exception as e:
+            print(f"Could not save mute to Redis: {e}", file=sys.stderr)
+    return expiry
+
+
+def remove_mute(word: str) -> bool:
+    existed = word in {w for w, _ in list_mutes()}
+    _mutes_local.pop(word, None)
+    r = get_redis()
+    if r:
+        try:
+            r.delete(MUTE_KEY_PREFIX + word)
+        except Exception:
+            pass
+    return existed
+
+
+def list_mutes() -> list[tuple[str, datetime]]:
+    """Active (word, expiry) pairs, soonest-expiring first."""
+    now = datetime.now(timezone.utc)
+    found = {w: e for w, e in _mutes_local.items() if e > now}
+    r = get_redis()
+    if r:
+        try:
+            for key in r.scan_iter(MUTE_KEY_PREFIX + "*"):
+                raw = r.get(key)
+                if raw:
+                    exp = datetime.fromisoformat(raw)
+                    if exp > now:
+                        found[key[len(MUTE_KEY_PREFIX):]] = exp
+        except Exception:
+            pass
+    for w in [w for w, e in _mutes_local.items() if e <= now]:
+        _mutes_local.pop(w, None)
+    return sorted(found.items(), key=lambda x: x[1])
+
+
+def muted_word(text: str) -> str | None:
+    """The first active muted word found in text (whole word), else None."""
+    low = (text or "").lower()
+    for word, _ in list_mutes():
+        if re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", low):
+            return word
+    return None
+
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([mhd])$", re.IGNORECASE)
+
+
+def _handle_command(text: str) -> str | None:
+    """Runs one /dampen-style command; returns the reply text (HTML) or None
+    if it isn't one of ours."""
+    m = re.match(r"^/(undampen|dampened|dampen)(?![a-z])(?:@\w+)?\s*(.*)$", text.strip(), re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    cmd, rest = m.group(1).lower(), m.group(2).strip()
+
+    if cmd == "dampened":
+        mutes = list_mutes()
+        if not mutes:
+            return "No active dampeners."
+        now = datetime.now(timezone.utc)
+        return "<b>Active dampeners</b>\n" + "\n".join(
+            f"• {html.escape(w)} — {_fmt_remaining((e - now).total_seconds())} left (until {_fmt_local(e)})"
+            for w, e in mutes
+        )
+
+    wm = re.match(r'^(?:"([^"]+)"|(\S+))\s*(.*)$', rest)
+    if not wm:
+        return ("Usage: <code>/dampen pyr 6h</code> · <code>/undampen pyr</code> · "
+                "<code>/dampened</code>")
+    word = (wm.group(1) or wm.group(2)).lower().lstrip("$").strip()
+    dur = wm.group(3).strip()
+    if len(word) < 2:
+        return "That word is too short to dampen."
+
+    if cmd == "undampen":
+        return (f"Removed dampener for <b>{html.escape(word)}</b>." if remove_mute(word)
+                else f"No active dampener for <b>{html.escape(word)}</b>.")
+
+    seconds = MUTE_DEFAULT_SECONDS
+    if dur:
+        dm = _DURATION_RE.match(dur)
+        if not dm:
+            return "Duration should look like <code>30m</code>, <code>6h</code> or <code>2d</code>."
+        seconds = int(dm.group(1)) * {"m": 60, "h": 3600, "d": 86400}[dm.group(2).lower()]
+    seconds = max(60, min(seconds, MUTE_MAX_SECONDS))
+    expiry = add_mute(word, seconds)
+    return (f"Dampened <b>{html.escape(word)}</b> for {_fmt_remaining(seconds)} "
+            f"(until {_fmt_local(expiry)}). Tweets containing it are skipped.")
+
+
+def process_telegram_commands():
+    """Reads new messages sent to the bot and runs any dampener commands.
+    Never raises — a Telegram hiccup must not stop tweet processing."""
+    global _tg_offset, _tg_warned
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        r = get_redis()
+        first_run = _tg_offset is None
+        if first_run and r:
+            saved = r.get(TG_OFFSET_KEY)
+            if saved:
+                _tg_offset = int(saved)
+        params = {"timeout": 0, "allowed_updates": '["message"]'}
+        if _tg_offset is not None:
+            params["offset"] = _tg_offset
+        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                            params=params, timeout=15)
+        if resp.status_code != 200:
+            if not _tg_warned:
+                print(f"Telegram getUpdates failed ({resp.status_code}): {resp.text[:200]} — "
+                      f"dampener commands won't work (a webhook on this bot blocks them).",
+                      file=sys.stderr)
+                _tg_warned = True
+            return
+        updates = resp.json().get("result", [])
+        # First ever run with no saved position: don't replay old backlog.
+        skip_backlog = first_run and _tg_offset is None
+        for u in updates:
+            _tg_offset = u["update_id"] + 1
+            msg = u.get("message") or {}
+            if skip_backlog or str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+                continue
+            reply = _handle_command(msg.get("text", ""))
+            if reply:
+                send_telegram_alert(reply)
+        if updates and r:
+            r.set(TG_OFFSET_KEY, str(_tg_offset))
+    except Exception as e:
+        print(f"Telegram command check failed: {e}", file=sys.stderr)
+
+
 _seen_local: set[str] = set()  # fallback when Redis is off / briefly down
 AI_MAX_ATTEMPTS_PER_TWEET = int(os.environ.get("AI_MAX_ATTEMPTS_PER_TWEET", "6"))  # polls, not calls
 _ai_fail_counts: dict[str, int] = {}
@@ -1303,6 +1484,11 @@ def _process_tweet(tweet: dict) -> bool:
     tweet["text"] = resolve_token_symbols(tweet["text"])
 
     preview = tweet["text"][:80].replace("\n", " ")
+
+    hit = muted_word(tweet["text"])
+    if hit:
+        print(f"  [muted: {hit}] @{tweet['username']}: {preview}")
+        return False
 
     # Cheap check FIRST so low-engagement tweets never cost an AI call.
     if likes < MIN_ENGAGEMENT_FILTER:
@@ -1403,6 +1589,7 @@ def _process_tweet(tweet: dict) -> bool:
 
 
 def run_once(since_id):
+    process_telegram_commands()
     tweets, newest_id, error = search_recent_tweets(since_id)
     if tweets:
         print(f"[{datetime.now(timezone.utc).isoformat()}] {len(tweets)} new candidate tweet(s).")
