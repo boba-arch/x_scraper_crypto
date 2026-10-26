@@ -42,6 +42,13 @@ GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
 # Optional second Grok model, used only when GROK_MODEL is overloaded ("at
 # capacity", 5xx, timeouts). Leave unset to disable.
 GROK_FALLBACK_MODEL = os.environ.get("GROK_FALLBACK_MODEL", "")
+
+# Sent as its own Telegram message right after every NEW-case alert.
+# Override with the NEW_CASE_REMINDER env var; set it empty to turn it off.
+NEW_CASE_REMINDER = os.environ.get(
+    "NEW_CASE_REMINDER",
+    "Don't forget to close deposit/withdrawal, and deposit not credited, also inform MM",
+)
 GROK_TIMEOUT_SECONDS = int(os.environ.get("GROK_TIMEOUT_SECONDS", "40"))   # per request
 GROK_TOTAL_BUDGET_SECONDS = int(os.environ.get("GROK_TOTAL_BUDGET_SECONDS", "75"))  # per tweet, all retries
 GROK_MIN_INTERVAL_SECONDS = float(os.environ.get("GROK_MIN_INTERVAL_SECONDS", "1.0"))  # between calls
@@ -504,6 +511,13 @@ def resolve_case_key(candidate_key: str, tweet_text: str = "", tweet_id: str = "
         key = f"{base}_{n}"
         n += 1
     return key
+
+
+def _set_case_flag(case_key: str, flag: str, value) -> None:
+    case = get_case(case_key)
+    if case is not None:
+        case[flag] = value
+        save_case(case_key, case)
 
 
 def upsert_case(case_key: str, tweet: dict, score: int, label: str, summary: str,
@@ -1282,6 +1296,7 @@ BOT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Jakarta")
 
 _mutes_local: dict[str, datetime] = {}  # word -> expiry (used when Redis is off)
 _tg_offset = None  # next Telegram update id to read
+_tg_started = False  # True once the first getUpdates call has completed
 _tg_warned = False
 
 
@@ -1404,12 +1419,12 @@ def _handle_command(text: str) -> str | None:
 def process_telegram_commands():
     """Reads new messages sent to the bot and runs any dampener commands.
     Never raises — a Telegram hiccup must not stop tweet processing."""
-    global _tg_offset, _tg_warned
+    global _tg_offset, _tg_warned, _tg_started
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         r = get_redis()
-        first_run = _tg_offset is None
+        first_run = not _tg_started
         if first_run and r:
             saved = r.get(TG_OFFSET_KEY)
             if saved:
@@ -1429,6 +1444,7 @@ def process_telegram_commands():
         updates = resp.json().get("result", [])
         # First ever run with no saved position: don't replay old backlog.
         skip_backlog = first_run and _tg_offset is None
+        _tg_started = True
         for u in updates:
             _tg_offset = u["update_id"] + 1
             msg = u.get("message") or {}
@@ -1436,6 +1452,7 @@ def process_telegram_commands():
                 continue
             reply = _handle_command(msg.get("text", ""))
             if reply:
+                print(f"Telegram command: {msg.get('text', '')[:60]!r}")
                 send_telegram_alert(reply)
         if updates and r:
             r.set(TG_OFFSET_KEY, str(_tg_offset))
@@ -1573,6 +1590,8 @@ def _process_tweet(tweet: dict) -> bool:
     if score < MIN_RISK_SCORE_TO_ALERT:
         print(f"    -> tracked but not alerted (below MIN_RISK_SCORE_TO_ALERT="
               f"{MIN_RISK_SCORE_TO_ALERT}) — case '{case_key}' updated silently")
+        if is_new_case:
+            _set_case_flag(case_key, "alerted", False)  # not paged yet
         return
 
     if is_new_case:
@@ -1584,6 +1603,16 @@ def _process_tweet(tweet: dict) -> bool:
         message = format_case_update_alert(tweet, score, label, case_key, changed_fields, fields)
 
     send_telegram_alert(message)
+    # The reminder goes out with the FIRST alert for a case — a brand-new
+    # case, or one that was tracked silently earlier (flag alerted=False) and
+    # has only now crossed the alert threshold. Cases saved before this
+    # feature have no flag and are treated as already alerted.
+    existing = get_case(case_key) or {}
+    first_alert = is_new_case or existing.get("alerted") is False
+    if first_alert:
+        _set_case_flag(case_key, "alerted", True)
+        if NEW_CASE_REMINDER:
+            send_telegram_alert(NEW_CASE_REMINDER)  # separate chat bubble
     print(f"    -> ALERT SENT")
     time.sleep(1)  # be gentle with Telegram's rate limits
 
