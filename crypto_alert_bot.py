@@ -717,6 +717,15 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
 # X query to cut billed noise.
 NOISE_EXCLUSIONS = ["giveaway", "airdrop"]
 
+# Accounts whose tweets are never read or classified (handles without the @).
+# Excluded in the X query itself, so they cost nothing, and again in
+# _process_tweet() as a safety net. Add more on Railway as a comma-separated
+# list in IGNORED_ACCOUNTS, e.g. "grok,someotheraccount".
+IGNORED_ACCOUNTS = [
+    a.strip().lstrip("@").lower()
+    for a in os.environ.get("IGNORED_ACCOUNTS", "grok").split(",") if a.strip()
+]
+
 # Hard cap on how many tweets we pull per poll — mainly a safety ceiling for
 # traffic bursts, since since_id tracking already prevents re-reads.
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "10"))
@@ -788,7 +797,9 @@ def _build_one_query(incident_terms: list[str], context_terms: list[str]) -> str
     # lower cost for wider coverage. The AI classification step is what
     # keeps this usable: it judges source credibility and current/active
     # status per-tweet instead of relying on a pre-vetted account list.
-    return f"({incident_clause}) ({context_clause}) {exclusions} -is:retweet -is:quote lang:en"
+    ignored = " ".join(f"-from:{a}" for a in IGNORED_ACCOUNTS)
+    return (f"({incident_clause}) ({context_clause}) {exclusions} {ignored} "
+            f"-is:retweet -is:quote lang:en").replace("  ", " ")
 
 
 def build_queries() -> list[str]:
@@ -1594,6 +1605,10 @@ def _process_tweet(tweet: dict) -> bool:
     tweet["text"] = resolve_token_symbols(tweet["text"])
 
     preview = tweet["text"][:80].replace("\n", " ")
+
+    if (tweet.get("username") or "").lower() in IGNORED_ACCOUNTS:
+        print(f"  [ignored account] @{tweet['username']}: {preview}")
+        return False
 
     hit = muted_word(tweet["text"])
     if hit:
