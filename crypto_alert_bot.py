@@ -58,6 +58,13 @@ DEEPSEEK_FALLBACK_MODEL = os.environ.get("DEEPSEEK_FALLBACK_MODEL", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 # Ask DeepSeek to return strict JSON. Set to 0 if it ever rejects the request.
 DEEPSEEK_JSON_MODE = os.environ.get("DEEPSEEK_JSON_MODE", "1") != "0"
+# DeepSeek's newer models "think" first, and that hidden thinking eats the
+# max_tokens budget (empty or cut-off JSON replies). We turn thinking off, and
+# give DeepSeek a roomier token limit as a safety margin (you pay only for
+# tokens actually produced). Set DEEPSEEK_THINKING= (empty) to not send the
+# switch at all.
+DEEPSEEK_THINKING = os.environ.get("DEEPSEEK_THINKING", "disabled").strip().lower()
+DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS", "1500"))
 
 AI_PROVIDERS = {
     "grok": {
@@ -70,6 +77,8 @@ AI_PROVIDERS = {
         "fallback_model": lambda: DEEPSEEK_FALLBACK_MODEL,
         "url": DEEPSEEK_BASE_URL.rstrip("/") + "/chat/completions",
         "json_mode": DEEPSEEK_JSON_MODE,
+        "extra": ({"thinking": {"type": DEEPSEEK_THINKING}} if DEEPSEEK_THINKING else {}),
+        "max_tokens": DEEPSEEK_MAX_TOKENS,
     },
 }
 
@@ -644,7 +653,7 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
     pname = cfg["name"]
     payload = {
         "model": model or cfg["model"](),
-        "max_tokens": max_tokens,
+        "max_tokens": max(max_tokens, cfg.get("max_tokens", 0)),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -652,6 +661,7 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
     }
     if cfg["json_mode"]:
         payload["response_format"] = {"type": "json_object"}
+    payload.update(cfg.get("extra", {}))
     headers = {
         "Authorization": f"Bearer {cfg['key']()}",
         "Content-Type": "application/json",
@@ -671,10 +681,14 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
             last_error = type(e).__name__
         else:
             if resp.ok:
-                content = (resp.json()["choices"][0]["message"].get("content") or "").strip()
-                if content:
+                data = resp.json()
+                choice = data["choices"][0]
+                content = (choice["message"].get("content") or "").strip()
+                if content and choice.get("finish_reason") != "length":
                     return content
-                last_error = f"empty reply from {pname}"
+                last_error = (f"{'cut-off' if content else 'empty'} reply from {pname} "
+                              f"(finish_reason={choice.get('finish_reason')}, "
+                              f"usage={data.get('usage')})")
                 resp = None
             # Include the provider's own explanation (spend limit, blocked key,
             # content filter...) — the bare status code hides it.
