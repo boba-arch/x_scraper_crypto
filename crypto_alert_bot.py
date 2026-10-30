@@ -36,12 +36,56 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")  # optional but strongly recommended
 
-# AI scoring uses Grok only (xAI). XAI_API_KEY is required.
+# --- Which AI scores the tweets (change these in Railway variables) ---------
+#   AI_PROVIDER           "grok" (default) or "deepseek"
+#   AI_FALLBACK_PROVIDER  optional: the other one, tried only if the main AI
+#                         fails completely. Leave empty for none.
+# Each provider needs its own key: XAI_API_KEY for Grok, DEEPSEEK_API_KEY for
+# DeepSeek (only the ones you actually use).
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "grok").strip().lower()
+AI_FALLBACK_PROVIDER = os.environ.get("AI_FALLBACK_PROVIDER", "").strip().lower()
+
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
 # Optional second Grok model, used only when GROK_MODEL is overloaded ("at
 # capacity", 5xx, timeouts). Leave unset to disable.
 GROK_FALLBACK_MODEL = os.environ.get("GROK_FALLBACK_MODEL", "")
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+# Check the current model name on platform.deepseek.com (names change).
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
+DEEPSEEK_FALLBACK_MODEL = os.environ.get("DEEPSEEK_FALLBACK_MODEL", "")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+# Ask DeepSeek to return strict JSON. Set to 0 if it ever rejects the request.
+DEEPSEEK_JSON_MODE = os.environ.get("DEEPSEEK_JSON_MODE", "1") != "0"
+
+AI_PROVIDERS = {
+    "grok": {
+        "name": "Grok", "key": lambda: XAI_API_KEY, "model": lambda: GROK_MODEL,
+        "fallback_model": lambda: GROK_FALLBACK_MODEL,
+        "url": "https://api.x.ai/v1/chat/completions", "json_mode": False,
+    },
+    "deepseek": {
+        "name": "DeepSeek", "key": lambda: DEEPSEEK_API_KEY, "model": lambda: DEEPSEEK_MODEL,
+        "fallback_model": lambda: DEEPSEEK_FALLBACK_MODEL,
+        "url": DEEPSEEK_BASE_URL.rstrip("/") + "/chat/completions",
+        "json_mode": DEEPSEEK_JSON_MODE,
+    },
+}
+
+
+def _ai_attempts():
+    """Ordered list of (provider, model) to try for each tweet: the main
+    provider's model, its optional backup model, then the fallback provider."""
+    out = []
+    for prov in [AI_PROVIDER, AI_FALLBACK_PROVIDER]:
+        cfg = AI_PROVIDERS.get(prov)
+        if not cfg or not cfg["key"]() or any(a[0] == prov for a in out):
+            continue
+        out.append((prov, cfg["model"]()))
+        if cfg["fallback_model"]():
+            out.append((prov, cfg["fallback_model"]()))
+    return out
 
 # Sent as its own Telegram message right after every NEW-case alert.
 # Override with the NEW_CASE_REMINDER env var; set it empty to turn it off.
@@ -585,8 +629,10 @@ _last_grok_call_at = 0.0
 
 
 def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
-               model: str | None = None, fast_fail: bool = False) -> str:
-    """Calls xAI's Grok API. Calls are spaced at least GROK_MIN_INTERVAL_SECONDS
+               model: str | None = None, fast_fail: bool = False,
+               provider: str = "grok") -> str:
+    """Calls the chosen AI's chat API (Grok or DeepSeek, same request
+    format; the name is historical). Calls are spaced at least GROK_MIN_INTERVAL_SECONDS
     apart (a batch of tweets would otherwise burst into xAI's rate limit).
     Retries on rate limits (429), server errors (5xx), timeouts and dropped
     connections, but gives up after GROK_TOTAL_BUDGET_SECONDS in total so one
@@ -594,16 +640,20 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
     "at capacity" 429 raises at once so the caller can switch models.
     Raises on failure."""
     global _last_grok_call_at
+    cfg = AI_PROVIDERS[provider]
+    pname = cfg["name"]
     payload = {
-        "model": model or GROK_MODEL,
+        "model": model or cfg["model"](),
         "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
     }
+    if cfg["json_mode"]:
+        payload["response_format"] = {"type": "json_object"}
     headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Authorization": f"Bearer {cfg['key']()}",
         "Content-Type": "application/json",
     }
     deadline = time.time() + GROK_TOTAL_BUDGET_SECONDS
@@ -615,28 +665,33 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
         _last_grok_call_at = time.time()
         wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
         try:
-            resp = requests.post("https://api.x.ai/v1/chat/completions", headers=headers,
+            resp = requests.post(cfg["url"], headers=headers,
                                  json=payload, timeout=GROK_TIMEOUT_SECONDS)
         except (requests.Timeout, requests.ConnectionError) as e:
             last_error = type(e).__name__
         else:
             if resp.ok:
-                return resp.json()["choices"][0]["message"]["content"].strip()
-            # Include xAI's own explanation (spend limit, blocked key, content
-            # filter...) — the bare status code hides it.
-            last_error = f"{resp.status_code} from xAI: {resp.text[:300]}"
-            if resp.status_code != 429 and resp.status_code < 500:
-                raise RuntimeError(last_error)  # not worth retrying
-            if fast_fail and "capacity" in resp.text.lower():
-                raise RuntimeError(last_error)  # overloaded model: switch instead of waiting
-            try:
-                wait = float(resp.headers.get("Retry-After", ""))
-            except ValueError:
-                pass
+                content = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+                if content:
+                    return content
+                last_error = f"empty reply from {pname}"
+                resp = None
+            # Include the provider's own explanation (spend limit, blocked key,
+            # content filter...) — the bare status code hides it.
+            if resp is not None:
+                last_error = f"{resp.status_code} from {pname}: {resp.text[:300]}"
+                if resp.status_code != 429 and resp.status_code < 500:
+                    raise RuntimeError(last_error)  # not worth retrying
+                if fast_fail and "capacity" in resp.text.lower():
+                    raise RuntimeError(last_error)  # overloaded model: switch instead of waiting
+                try:
+                    wait = float(resp.headers.get("Retry-After", ""))
+                except ValueError:
+                    pass
         wait = min(max(wait, 1), 15)
         if attempt == 3 or time.time() + wait > deadline:
             break
-        print(f"Grok {last_error[:60]} — retrying in {wait:.0f}s ({attempt + 1}/3)...", file=sys.stderr)
+        print(f"{pname} {last_error[:60]} — retrying in {wait:.0f}s ({attempt + 1}/3)...", file=sys.stderr)
         time.sleep(wait)
     raise RuntimeError(f"gave up after retries: {last_error}")
 
@@ -827,15 +882,38 @@ def search_recent_tweets(since_id: str | None):
     return _search_one_query(build_queries()[0], since_id)
 
 
+# Incidents at these exchanges are top priority. Edit the list on GitHub.
+MAJOR_EXCHANGES = [
+    "Binance", "Bybit", "OKX", "Coinbase", "KuCoin", "MEXC", "Bitget",
+    "Bithumb", "Upbit", "Kraken", "Gate.io", "HTX", "Crypto.com",
+    "Bitfinex", "Bitstamp", "Gemini", "Deribit", "BingX", "Bitrue",
+]
+
+
+def _major_exchange_in(text: str) -> str | None:
+    low = (text or "").lower()
+    for name in MAJOR_EXCHANGES:
+        if re.search(r"(?<![a-z0-9])" + re.escape(name.lower()) + r"(?![a-z0-9])", low):
+            return name
+    return None
+
+
 def _build_classification_prompt(trusted_list: str) -> str:
     return (
         "Is this tweet reporting that a crypto attack, hack, exploit or "
-        "security incident is happening RIGHT NOW? Tweets from trusted "
-        f"accounts score higher. Trusted: {trusted_list}.\n\n"
+        "security incident is happening RIGHT NOW? We want to hear FIRST, so "
+        "do not discard an unverified claim: if it names a specific platform "
+        "and an amount, wallet or concrete detail, it counts (true) and "
+        "scores at least 45 even from a small account, however large the "
+        "claim. Only vague talk, opinions, old news, ads and questions are "
+        "false. A hack, drain or halted withdrawals at a major exchange "
+        f"({', '.join(MAJOR_EXCHANGES)}) scores 85+ even from an unverified "
+        f"account. Trusted accounts score higher. Trusted: {trusted_list}.\n\n"
         "Respond with ONLY valid JSON (no markdown):\n"
-        '{"is_real_incident": true/false, "risk_score": 0-100 (0-24 not an '
-        "incident, 25-44 plausible, 45-69 credible and unfolding, 70-100 "
-        'major and active), "case_key": "if this is about a case in Known '
+        '{"is_real_incident": true/false (true = the tweet claims an '
+        'incident is happening now), "risk_score": 0-100 (0-24 not an '
+        "incident, 25-44 vague, 45-69 specific claim or credible, 70-100 "
+        'major and active or from a trusted account), "case_key": "if this is about a case in Known '
         "open cases, copy its key EXACTLY; otherwise up to 3 distinctive "
         "lowercase words from the tweet joined by _ (project/company, plus "
         "attacker, victim or place if named; never generic words like hack, "
@@ -908,6 +986,42 @@ def _parse_classification_json(text: str, provider: str):
         return None
 
 
+# Words that mean "something bad is happening" when they sit next to an
+# exchange name. Used only by the safety net below.
+_EXCHANGE_INCIDENT_RE = re.compile(
+    r"hack(ed|ing|s)?|drain(ed|ing|s)?|exploit(ed|s)?|stolen|steal(ing)?|"
+    r"breach(ed)?|compromis(ed|e)|unauthori[sz]ed|"
+    r"(withdraw\w*|deposit\w*)\W+(\w+\W+){0,3}(halt|suspend|paus|freez|frozen)\w*|"
+    r"(halt|suspend|paus|freez|frozen)\w*\W+(\w+\W+){0,3}(withdraw|deposit)\w*",
+    re.I,
+)
+
+
+def _apply_exchange_floor(result, tweet_text: str):
+    """Safety net behind the prompt, so a big-exchange incident always alerts
+    even if Grok under-scores it.
+      - Grok accepted it as an incident (score >= 45): raise to at least 70.
+      - Grok rejected it, but the tweet names a major exchange AND an
+        incident word (hacked / drained / withdrawals halted ...): raise to
+        50 (HIGH) so we hear it first; a human can dismiss it."""
+    if not result:
+        return result
+    exch = _major_exchange_in(tweet_text)
+    if not exch:
+        return result
+    if result["score"] >= 45 and result["score"] < 70:
+        new_score = 70
+    elif result["score"] < 45 and _EXCHANGE_INCIDENT_RE.search(tweet_text or ""):
+        new_score = 50
+    else:
+        return result
+    print(f"    -> major exchange ({exch}) mentioned: score raised "
+          f"{result['score']} -> {new_score}", file=sys.stderr)
+    result["score"] = new_score
+    result["label"] = "CRITICAL" if new_score >= 70 else "HIGH"
+    return result
+
+
 _last_ai_error = ""  # newest Grok failure text, shown in the Telegram health alert
 
 
@@ -920,7 +1034,8 @@ def classify_with_ai(tweet: dict):
     caller skips the tweet and pages on Telegram (see
     note_ai_failure_and_maybe_alert()).
     """
-    if not XAI_API_KEY:
+    attempts = _ai_attempts()
+    if not attempts:
         return None
 
     username = tweet.get("username", "unknown")
@@ -936,16 +1051,19 @@ def classify_with_ai(tweet: dict):
 
     system_prompt = _build_classification_prompt(trusted_list)
 
-    models = [GROK_MODEL] + ([GROK_FALLBACK_MODEL] if GROK_FALLBACK_MODEL else [])
-    for i, model in enumerate(models):
+    for i, (prov, model) in enumerate(attempts):
+        pname = AI_PROVIDERS[prov]["name"]
         try:
             text = _call_grok(system_prompt, user_message, max_tokens=400, model=model,
-                              fast_fail=(i == 0 and len(models) > 1))
-            return _parse_classification_json(text, f"grok ({model})")
+                              fast_fail=(i < len(attempts) - 1), provider=prov)
+            result = _parse_classification_json(text, f"{pname} ({model})")
+            if result:
+                return _apply_exchange_floor(result, tweet["text"])
+            raise RuntimeError(f"unreadable reply from {pname}: {text[:200]!r}")
         except Exception as e:
             global _last_ai_error
             _last_ai_error = str(e)
-            print(f"Grok ({model}) classification failed: {e}", file=sys.stderr)
+            print(f"{pname} ({model}) classification failed: {e}", file=sys.stderr)
     return None
 
 
@@ -1205,8 +1323,8 @@ def run_self_test():
     ai_result = classify_with_ai(test_tweet)
     if not ai_result:
         print("AI classification failed — Grok was unreachable/erroring or "
-              "isn't configured. Check XAI_API_KEY.", file=sys.stderr)
-        send_system_alert("Self-test: AI classification failed. Check XAI_API_KEY.")
+              "isn't configured. Check AI_PROVIDER and its API key.", file=sys.stderr)
+        send_system_alert("Self-test: AI classification failed. Check AI_PROVIDER and its API key.")
         return
 
     score = ai_result["score"]
@@ -1267,11 +1385,11 @@ def note_ai_failure_and_maybe_alert():
     if cooldown_elapsed:
         reason = _readable_ai_error(_last_ai_error)
         send_system_alert(
-            "Grok classification is failing. Tweets are queued and retried "
+            f"{AI_PROVIDERS.get(AI_PROVIDER, AI_PROVIDERS['grok'])['name']} classification is failing. Tweets are queued and retried "
             f"for about {AI_MAX_ATTEMPTS_PER_TWEET} polls, then dropped, so you "
             "may miss incidents until this recovers.\n\n"
-            f"<b>xAI says:</b> {html.escape(reason)}\n\n"
-            f"<b>xAI 提示：</b> {html.escape(translate_to_chinese(reason))}"
+            f"<b>AI says:</b> {html.escape(reason)}\n\n"
+            f"<b>AI 提示：</b> {html.escape(translate_to_chinese(reason))}"
         )
         _last_ai_failure_alert_at = now
 
@@ -1665,13 +1783,22 @@ def main():
               "TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.", file=sys.stderr)
         sys.exit(1)
 
-    if not XAI_API_KEY:
-        print("ERROR: XAI_API_KEY is not set. Scoring is AI-only — the bot "
-              "cannot classify tweets without it.", file=sys.stderr)
+    if AI_PROVIDER not in AI_PROVIDERS:
+        print(f"ERROR: AI_PROVIDER={AI_PROVIDER!r} is not valid. Use 'grok' or "
+              "'deepseek'.", file=sys.stderr)
         sys.exit(1)
-
-    print(f"AI: Grok ({GROK_MODEL})"
-          + (f", fallback model {GROK_FALLBACK_MODEL}" if GROK_FALLBACK_MODEL else "")
+    if AI_FALLBACK_PROVIDER and AI_FALLBACK_PROVIDER not in AI_PROVIDERS:
+        print(f"ERROR: AI_FALLBACK_PROVIDER={AI_FALLBACK_PROVIDER!r} is not valid. "
+              "Use 'grok', 'deepseek' or leave it empty.", file=sys.stderr)
+        sys.exit(1)
+    attempts = _ai_attempts()
+    if not attempts or attempts[0][0] != AI_PROVIDER:
+        need = "XAI_API_KEY" if AI_PROVIDER == "grok" else "DEEPSEEK_API_KEY"
+        print(f"ERROR: AI_PROVIDER is '{AI_PROVIDER}' but {need} is not set. "
+              "Scoring is AI-only — the bot cannot classify tweets without it.",
+              file=sys.stderr)
+        sys.exit(1)
+    print("AI order: " + " -> ".join(f"{AI_PROVIDERS[p]['name']} ({m})" for p, m in attempts)
           + ". No live X search.")
 
     if REDIS_URL:
