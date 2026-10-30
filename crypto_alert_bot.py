@@ -896,7 +896,9 @@ def search_recent_tweets(since_id: str | None):
     return _search_one_query(build_queries()[0], since_id)
 
 
-# Incidents at these exchanges are top priority. Edit the list on GitHub.
+# Incidents at these exchanges get a small score bonus. Edit the list on GitHub.
+# EXCHANGE_SCORE_BOOST (Railway variable) = points added; 0 turns it off.
+EXCHANGE_SCORE_BOOST = int(os.environ.get("EXCHANGE_SCORE_BOOST", "10"))
 MAJOR_EXCHANGES = [
     "Binance", "Bybit", "OKX", "Coinbase", "KuCoin", "MEXC", "Bitget",
     "Bithumb", "Upbit", "Kraken", "Gate.io", "HTX", "Crypto.com",
@@ -920,9 +922,9 @@ def _build_classification_prompt(trusted_list: str) -> str:
         "and an amount, wallet or concrete detail, it counts (true) and "
         "scores at least 45 even from a small account, however large the "
         "claim. Only vague talk, opinions, old news, ads and questions are "
-        "false. A hack, drain or halted withdrawals at a major exchange "
-        f"({', '.join(MAJOR_EXCHANGES)}) scores 85+ even from an unverified "
-        f"account. Trusted accounts score higher. Trusted: {trusted_list}.\n\n"
+        "false. Score a hack, drain or halted withdrawals at a major exchange "
+        f"({', '.join(MAJOR_EXCHANGES)}) only slightly higher (about "
+        f"+{EXCHANGE_SCORE_BOOST}) than the same claim elsewhere. Trusted accounts score higher. Trusted: {trusted_list}.\n\n"
         "Respond with ONLY valid JSON (no markdown):\n"
         '{"is_real_incident": true/false (true = the tweet claims an '
         'incident is happening now), "risk_score": 0-100 (0-24 not an '
@@ -1012,27 +1014,28 @@ _EXCHANGE_INCIDENT_RE = re.compile(
 
 
 def _apply_exchange_floor(result, tweet_text: str):
-    """Safety net behind the prompt, so a big-exchange incident always alerts
-    even if Grok under-scores it.
-      - Grok accepted it as an incident (score >= 45): raise to at least 70.
-      - Grok rejected it, but the tweet names a major exchange AND an
-        incident word (hacked / drained / withdrawals halted ...): raise to
-        50 (HIGH) so we hear it first; a human can dismiss it."""
-    if not result:
+    """Small safety net behind the prompt. The prompt itself asks Grok for a
+    modest bonus (about EXCHANGE_SCORE_BOOST points) when a major exchange is
+    hit. This only rescues the case where Grok rejects the tweet (score < 45)
+    although it names a major exchange AND an incident word (hacked / drained
+    / withdrawals halted ...): the score is raised to 45 (low HIGH) so we
+    still hear it first. Nothing else is changed."""
+    if not result or EXCHANGE_SCORE_BOOST <= 0:
         return result
     exch = _major_exchange_in(tweet_text)
     if not exch:
         return result
-    if result["score"] >= 45 and result["score"] < 70:
-        new_score = 70
-    elif result["score"] < 45 and _EXCHANGE_INCIDENT_RE.search(tweet_text or ""):
-        new_score = 50
+    old = result["score"]
+    if old >= 45:
+        return result  # Grok already saw a real incident; its prompt boost applies
+    if _EXCHANGE_INCIDENT_RE.search(tweet_text or ""):
+        new_score = 45
     else:
         return result
     print(f"    -> major exchange ({exch}) mentioned: score raised "
-          f"{result['score']} -> {new_score}", file=sys.stderr)
+          f"{old} -> {new_score}", file=sys.stderr)
     result["score"] = new_score
-    result["label"] = "CRITICAL" if new_score >= 70 else "HIGH"
+    result["label"] = "HIGH"
     return result
 
 
