@@ -896,40 +896,15 @@ def search_recent_tweets(since_id: str | None):
     return _search_one_query(build_queries()[0], since_id)
 
 
-# Incidents at these exchanges get a small score bonus. Edit the list on GitHub.
-# EXCHANGE_SCORE_BOOST (Railway variable) = points added; 0 turns it off.
-EXCHANGE_SCORE_BOOST = int(os.environ.get("EXCHANGE_SCORE_BOOST", "10"))
-MAJOR_EXCHANGES = [
-    "Binance", "Bybit", "OKX", "Coinbase", "KuCoin", "MEXC", "Bitget",
-    "Bithumb", "Upbit", "Kraken", "Gate.io", "HTX", "Crypto.com",
-    "Bitfinex", "Bitstamp", "Gemini", "Deribit", "BingX", "Bitrue",
-]
-
-
-def _major_exchange_in(text: str) -> str | None:
-    low = (text or "").lower()
-    for name in MAJOR_EXCHANGES:
-        if re.search(r"(?<![a-z0-9])" + re.escape(name.lower()) + r"(?![a-z0-9])", low):
-            return name
-    return None
-
-
 def _build_classification_prompt(trusted_list: str) -> str:
     return (
         "Is this tweet reporting that a crypto attack, hack, exploit or "
-        "security incident is happening RIGHT NOW? We want to hear FIRST, so "
-        "do not discard an unverified claim: if it names a specific platform "
-        "and an amount, wallet or concrete detail, it counts (true) and "
-        "scores at least 45 even from a small account, however large the "
-        "claim. Only vague talk, opinions, old news, ads and questions are "
-        "false. Score a hack, drain or halted withdrawals at a major exchange "
-        f"({', '.join(MAJOR_EXCHANGES)}) only slightly higher (about "
-        f"+{EXCHANGE_SCORE_BOOST}) than the same claim elsewhere. Trusted accounts score higher. Trusted: {trusted_list}.\n\n"
+        "security incident is happening RIGHT NOW? Tweets from trusted "
+        f"accounts score higher. Trusted: {trusted_list}.\n\n"
         "Respond with ONLY valid JSON (no markdown):\n"
-        '{"is_real_incident": true/false (true = the tweet claims an '
-        'incident is happening now), "risk_score": 0-100 (0-24 not an '
-        "incident, 25-44 vague, 45-69 specific claim or credible, 70-100 "
-        'major and active or from a trusted account), "case_key": "if this is about a case in Known '
+        '{"is_real_incident": true/false, "risk_score": 0-100 (0-24 not an '
+        "incident, 25-44 plausible, 45-69 credible and unfolding, 70-100 "
+        'major and active), "case_key": "if this is about a case in Known '
         "open cases, copy its key EXACTLY; otherwise up to 3 distinctive "
         "lowercase words from the tweet joined by _ (project/company, plus "
         "attacker, victim or place if named; never generic words like hack, "
@@ -1007,43 +982,6 @@ def _parse_classification_json(text: str, provider: str):
         return None
 
 
-# Words that mean "something bad is happening" when they sit next to an
-# exchange name. Used only by the safety net below.
-_EXCHANGE_INCIDENT_RE = re.compile(
-    r"hack(ed|ing|s)?|drain(ed|ing|s)?|exploit(ed|s)?|stolen|steal(ing)?|"
-    r"breach(ed)?|compromis(ed|e)|unauthori[sz]ed|"
-    r"(withdraw\w*|deposit\w*)\W+(\w+\W+){0,3}(halt|suspend|paus|freez|frozen)\w*|"
-    r"(halt|suspend|paus|freez|frozen)\w*\W+(\w+\W+){0,3}(withdraw|deposit)\w*",
-    re.I,
-)
-
-
-def _apply_exchange_floor(result, tweet_text: str):
-    """Small safety net behind the prompt. The prompt itself asks Grok for a
-    modest bonus (about EXCHANGE_SCORE_BOOST points) when a major exchange is
-    hit. This only rescues the case where Grok rejects the tweet (score < 45)
-    although it names a major exchange AND an incident word (hacked / drained
-    / withdrawals halted ...): the score is raised to 45 (low HIGH) so we
-    still hear it first. Nothing else is changed."""
-    if not result or EXCHANGE_SCORE_BOOST <= 0:
-        return result
-    exch = _major_exchange_in(tweet_text)
-    if not exch:
-        return result
-    old = result["score"]
-    if old >= 45:
-        return result  # Grok already saw a real incident; its prompt boost applies
-    if _EXCHANGE_INCIDENT_RE.search(tweet_text or ""):
-        new_score = 45
-    else:
-        return result
-    print(f"    -> major exchange ({exch}) mentioned: score raised "
-          f"{old} -> {new_score}", file=sys.stderr)
-    result["score"] = new_score
-    result["label"] = "HIGH"
-    return result
-
-
 _last_ai_error = ""  # newest Grok failure text, shown in the Telegram health alert
 
 
@@ -1080,7 +1018,7 @@ def classify_with_ai(tweet: dict):
                               fast_fail=(i < len(attempts) - 1), provider=prov)
             result = _parse_classification_json(text, f"{pname} ({model})")
             if result:
-                return _apply_exchange_floor(result, tweet["text"])
+                return result
             raise RuntimeError(f"unreadable reply from {pname}: {text[:200]!r}")
         except Exception as e:
             global _last_ai_error
@@ -1569,7 +1507,7 @@ def process_telegram_commands():
             saved = r.get(TG_OFFSET_KEY)
             if saved:
                 _tg_offset = int(saved)
-        params = {"timeout": 0, "allowed_updates": '["message"]'}
+        params = {"timeout": 0, "allowed_updates": '["message","channel_post"]'}
         if _tg_offset is not None:
             params["offset"] = _tg_offset
         resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
@@ -1577,20 +1515,35 @@ def process_telegram_commands():
         if resp.status_code != 200:
             if not _tg_warned:
                 print(f"Telegram getUpdates failed ({resp.status_code}): {resp.text[:200]} — "
-                      f"dampener commands won't work (a webhook on this bot blocks them).",
+                      f"dampener commands won't work (409 = a webhook is set on this bot, or "
+                      f"another copy of the bot is running with the same Telegram token).",
                       file=sys.stderr)
                 _tg_warned = True
             return
+        _tg_warned = False
         updates = resp.json().get("result", [])
-        # First ever run with no saved position: don't replay old backlog.
-        skip_backlog = first_run and _tg_offset is None
         _tg_started = True
+        now_ts = time.time()
         for u in updates:
             _tg_offset = u["update_id"] + 1
-            msg = u.get("message") or {}
-            if skip_backlog or str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+            msg = u.get("message") or u.get("channel_post") or {}
+            text = msg.get("text", "") or ""
+            chat_id = str(msg.get("chat", {}).get("id"))
+            if not text.strip().startswith("/"):
                 continue
-            reply = _handle_command(msg.get("text", ""))
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                print(f"Telegram command {text[:40]!r} ignored: it came from chat "
+                      f"{chat_id}, but TELEGRAM_CHAT_ID is {TELEGRAM_CHAT_ID}. Send "
+                      f"commands in the same chat the alerts arrive in.", file=sys.stderr)
+                continue
+            # Old backlog (e.g. sent long before a restart) is not replayed,
+            # but a command from the last 15 minutes still counts.
+            if now_ts - msg.get("date", now_ts) > 900:
+                print(f"Telegram command {text[:40]!r} ignored: older than 15 minutes.")
+                continue
+            reply = _handle_command(text)
+            if not reply:
+                print(f"Telegram: unknown command {text[:40]!r} (try /dampen, /undampen, /dampened)")
             if reply:
                 print(f"Telegram command: {msg.get('text', '')[:60]!r}")
                 send_telegram_alert(reply)
