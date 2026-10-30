@@ -956,8 +956,13 @@ def _parse_classification_json(text: str, provider: str):
     try:
         text = text.replace("```json", "").replace("```", "").strip()
 
+        # Models sometimes add stray characters around the JSON (a trailing
+        # backtick, "Here is the JSON:" ...). Read just the first {...} object.
+        start = text.find("{")
+        if start > 0:
+            text = text[start:]
         try:
-            parsed = json.loads(text)
+            parsed, _end = json.JSONDecoder().raw_decode(text)
         except json.JSONDecodeError:
             # Common failure mode: the model put a literal line break inside
             # a string value instead of escaping it as \n. Try a repair
@@ -969,7 +974,7 @@ def _parse_classification_json(text: str, provider: str):
                 text,
                 flags=re.DOTALL,
             )
-            parsed = json.loads(repaired)  # let this raise if still broken
+            parsed, _end = json.JSONDecoder().raw_decode(repaired)  # raises if still broken
 
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
         is_real = bool(parsed.get("is_real_incident", False))
