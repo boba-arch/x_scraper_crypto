@@ -931,6 +931,84 @@ def _build_classification_prompt(trusted_list: str) -> str:
     )
 
 
+# A longer, more careful prompt used only for DeepSeek (cheap tokens, and its
+# system prompt is identical on every call, so it is billed at the cheap
+# "cache hit" rate). Set SMART_PROMPT=0 on Railway to use the short original
+# prompt for DeepSeek too.
+SMART_PROMPT = os.environ.get("SMART_PROMPT", "1") != "0"
+
+
+def _build_smart_prompt(trusted_list: str) -> str:
+    return (
+        "You are a crypto security analyst on an incident-response desk. "
+        "Decide whether this tweet reports a crypto attack, hack, exploit, "
+        "theft or security failure that is happening NOW or just happened "
+        "(within about the last day), and how serious it is. We want to hear "
+        "about REAL fresh incidents first, even from small accounts, but we "
+        "do NOT want noise.\n\n"
+        "COUNTS AS REAL (is_real_incident true): a named platform, protocol, "
+        "exchange, bridge or wallet AND a concrete event, such as: funds "
+        "drained or stolen; a bug or exploit being abused; hot-wallet or key "
+        "compromise; website, DNS or front-end hijack; supply-chain "
+        "compromise; deposits or withdrawals halted or contract paused "
+        "because of an attack; rug pull in progress; stolen funds moving "
+        "(bridged, swapped, mixed, sent to an exchange); an attacker address "
+        "or transaction hash; an official acknowledgement, statement or "
+        "post-mortem of a fresh incident. An unverified claim from a small "
+        "account still counts if it has concrete detail (platform + amount, "
+        "address, tx hash, specific mechanism).\n\n"
+        "NOT AN INCIDENT (is_real_incident false, score 0-15): security tips "
+        "and how-to guides; generic scam or phishing warnings with no "
+        "specific fresh event; retrospectives, anniversaries and lists of "
+        "past hacks (Bybit, Ronin, FTX, etc.); weekly or quarterly stats and "
+        "reports; predictions, opinions, fear or speculation (\"could be "
+        "hacked\", \"if X gets hacked\"); questions, replies asking \"is "
+        "this true?\", jokes and memes; ads for audits, bug bounties, wallets "
+        "or security products; giveaways and airdrops; price or market "
+        "commentary or a token crash with no attack claimed; non-crypto "
+        "\"hacks\" (life hacks, growth hacking, hackathons); vague claims "
+        "with no platform and no detail; a single person losing a small "
+        "amount (about under $10k) from their own wallet or account with no "
+        "platform failure behind it.\n\n"
+        "SCORING: 0-24 not an incident. 25-44 weak, vague or unconfirmed "
+        "but plausible. 45-69 specific claim with concrete detail, or a "
+        "credible but smaller incident (under about $1M). 70-100 credible "
+        "AND large or urgent: about $1M or more at stake, a major exchange "
+        "or top protocol, an active ongoing drain, or a trusted account "
+        "giving details. Verified status alone is not proof. Do not inflate "
+        "the score because a tweet sounds dramatic or uses many emojis. "
+        "Tweets from trusted accounts score higher. Trusted: "
+        f"{trusted_list}.\n\n"
+        "EXAMPLES:\n"
+        "- \"Bybit hot wallet drained, ~$1.4B ETH moving to new addresses 0x...\" "
+        "-> real, 90.\n"
+        "- \"Protocol X paused after oracle exploit, ~$3M lost\" -> real, 65.\n"
+        "- \"Lost 2 ETH to a phishing site last night, be careful\" -> "
+        "personal loss, false, 10.\n"
+        "- \"1 year since the Bybit hack, here is what we learned\" -> false, 5.\n"
+        "- \"Top 5 ways to avoid getting drained\" -> false, 3.\n"
+        "- \"Is exchange Y hacked? Withdrawals look slow\" -> question, "
+        "false, 10.\n\n"
+        "Respond with ONLY valid JSON (no markdown, nothing before or after):\n"
+        '{"reason": "max 20 words: the evidence for your verdict", '
+        '"is_real_incident": true/false, "risk_score": 0-100, '
+        '"case_key": "if this is about a case in Known open cases, copy its '
+        "key EXACTLY; otherwise up to 3 distinctive lowercase words from the "
+        "tweet joined by _ (project/company, plus attacker, victim or place "
+        "if named; never generic words like hack, exploit, incident, supply, "
+        'wallet, crypto, and no dates)", '
+        '"tokens_affected": "symbols or \'unknown\'", '
+        '"estimated_loss_usd": "only if the tweet states or clearly implies '
+        'it, e.g. \'~$3M\', else \'unknown\'", '
+        '"latest_official_response": "what the project/exchange said or '
+        'did, or \'unknown\'", "hacker_addresses": "addresses stated in the '
+        'tweet, or \'unknown\'", "asset_movement": "where stolen funds are '
+        'moving, or \'unknown\'", "status": "ongoing | contained | resolved '
+        '| unknown", "summary": "max 140 chars: \'<Project>: <what\'s '
+        'happening>\'"}'
+    )
+
+
 def _parse_classification_json(text: str, provider: str):
     """
     Shared JSON parsing/repair for classify_with_ai()'s response, used by
@@ -1020,10 +1098,22 @@ def classify_with_ai(tweet: dict):
         f"about one of these — see case_key instructions):\n{open_cases}"
     )
 
-    system_prompt = _build_classification_prompt(trusted_list)
+    # How old the tweet is helps the AI tell fresh news from old news.
+    age_note = ""
+    try:
+        created = datetime.fromisoformat(str(tweet.get("created_at")).replace("Z", "+00:00"))
+        mins = max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
+        age_note = (f"Posted: {mins} minutes ago\n" if mins < 180
+                    else f"Posted: about {mins // 60} hours ago\n")
+    except Exception:
+        pass
+    user_message = user_message.replace("Tweet text:", age_note + "Tweet text:", 1)
 
     for i, (prov, model) in enumerate(attempts):
         pname = AI_PROVIDERS[prov]["name"]
+        system_prompt = (_build_smart_prompt(trusted_list)
+                         if prov == "deepseek" and SMART_PROMPT
+                         else _build_classification_prompt(trusted_list))
         try:
             text = _call_grok(system_prompt, user_message, max_tokens=400, model=model,
                               fast_fail=(i < len(attempts) - 1), provider=prov)
