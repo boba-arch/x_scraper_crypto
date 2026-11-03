@@ -66,6 +66,25 @@ DEEPSEEK_JSON_MODE = os.environ.get("DEEPSEEK_JSON_MODE", "1") != "0"
 DEEPSEEK_THINKING = os.environ.get("DEEPSEEK_THINKING", "disabled").strip().lower()
 DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS", "1500"))
 
+# --- Grok double-check -------------------------------------------------------
+# After the main AI (e.g. DeepSeek) scores a tweet and the bot is about to send
+# an alert, tweets scoring at least GROK_VERIFY_MIN_SCORE are shown to Grok,
+# which checks (by default with a live X search) whether the incident is real
+# and NEW. Grok can cancel the alert (old news / not an incident) or adjust the
+# score. If Grok fails or finds nothing either way, the alert is still sent,
+# marked as unconfirmed. Needs XAI_API_KEY. Skipped for trusted accounts and
+# when Grok is already the main AI.
+GROK_VERIFY = os.environ.get("GROK_VERIFY", "1") != "0"
+GROK_VERIFY_MIN_SCORE = int(os.environ.get("GROK_VERIFY_MIN_SCORE", "45"))
+# 1 = Grok searches X first (billed per post fetched, ~$5 per 1,000 posts, plus
+# tokens). 0 = plain Grok, no search (cheaper, judges from its own knowledge).
+GROK_VERIFY_SEARCH = os.environ.get("GROK_VERIFY_SEARCH", "1") != "0"
+GROK_VERIFY_MODEL = os.environ.get("GROK_VERIFY_MODEL", "")  # default: GROK_MODEL
+GROK_VERIFY_FROM_DAYS = int(os.environ.get("GROK_VERIFY_FROM_DAYS", "3"))  # search window; 0 = no limit
+GROK_VERIFY_MAX_TURNS = int(os.environ.get("GROK_VERIFY_MAX_TURNS", "2"))  # search rounds
+GROK_VERIFY_TIMEOUT_SECONDS = int(os.environ.get("GROK_VERIFY_TIMEOUT_SECONDS", "60"))
+GROK_VERIFY_MAX_TOKENS = int(os.environ.get("GROK_VERIFY_MAX_TOKENS", "1500"))
+
 AI_PROVIDERS = {
     "grok": {
         "name": "Grok", "key": lambda: XAI_API_KEY, "model": lambda: GROK_MODEL,
@@ -940,57 +959,95 @@ SMART_PROMPT = os.environ.get("SMART_PROMPT", "1") != "0"
 
 def _build_smart_prompt(trusted_list: str) -> str:
     return (
-        "You are a crypto security analyst on an incident-response desk. "
-        "Decide whether this tweet reports a crypto attack, hack, exploit, "
-        "theft or security failure that is happening NOW or just happened "
-        "(within about the last day), and how serious it is. We want to hear "
-        "about REAL fresh incidents first, even from small accounts, but we "
-        "do NOT want noise.\n\n"
-        "COUNTS AS REAL (is_real_incident true): a named platform, protocol, "
-        "exchange, bridge or wallet AND a concrete event, such as: funds "
-        "drained or stolen; a bug or exploit being abused; hot-wallet or key "
-        "compromise; website, DNS or front-end hijack; supply-chain "
-        "compromise; deposits or withdrawals halted or contract paused "
+        "You are a crypto security analyst on an incident-response desk. The "
+        "message gives today's date (UTC), how long ago the tweet was posted, "
+        "and the tweet. Decide whether the tweet reports a NEW crypto "
+        "security incident that is happening now or began within roughly the "
+        "last 24 hours (or a fresh development of one). We want real fresh "
+        "incidents first, even from small accounts. Old incidents and noise "
+        "waste our time.\n\n"
+        "STEP 1 - FRESHNESS (most important). \"Posted\" is when the TWEET was "
+        "written, not when the incident happened. Many tweets today discuss "
+        "OLD incidents. Answer false if ANY of these is true:\n"
+        "- it recaps, analyses, mourns or compares a past hack (Bybit, Ronin, "
+        "Wormhole, Poly Network, FTX, Mt. Gox, Nomad, Euler, Cetus, Nobitex, "
+        "WazirX, DMM, Atomic Wallet, Harmony, Multichain, Curve, ...) or uses "
+        "words like \"last year\", \"in 2025\", \"back in\", \"anniversary\", "
+        "\"largest ever\", \"history\", \"lessons\", \"post-mortem\" with no "
+        "new event today;\n"
+        "- it names a date or year before today as when the incident "
+        "happened;\n"
+        "- it is about a court case, arrest, sanction, settlement, repayment, "
+        "recovery or law-enforcement update on an old hack (unless NEW funds "
+        "are moving today);\n"
+        "- it only says something \"was hacked\" with no sign of when and no "
+        "detail;\n"
+        "- you cannot point to words showing it is new (\"just\", \"right "
+        "now\", \"minutes ago\", \"today\", \"is being drained\", \"ongoing\", "
+        "\"investigating\", or a first-time report with an amount, address or "
+        "tx hash).\n"
+        "A fresh development of a case listed in Known open cases (funds "
+        "moved, official statement, new address) still counts.\n\n"
+        "STEP 2 - IS IT A SECURITY INCIDENT?\n"
+        "COUNTS: a named platform, protocol, exchange, bridge or wallet AND a "
+        "concrete event: funds drained or stolen; exploit or bug being "
+        "abused; hot-wallet or key compromise; website, DNS or front-end "
+        "hijack; supply-chain compromise; deposits or withdrawals halted "
         "because of an attack; rug pull in progress; stolen funds moving "
-        "(bridged, swapped, mixed, sent to an exchange); an attacker address "
-        "or transaction hash; an official acknowledgement, statement or "
-        "post-mortem of a fresh incident. An unverified claim from a small "
-        "account still counts if it has concrete detail (platform + amount, "
-        "address, tx hash, specific mechanism).\n\n"
-        "NOT AN INCIDENT (is_real_incident false, score 0-15): security tips "
-        "and how-to guides; generic scam or phishing warnings with no "
-        "specific fresh event; retrospectives, anniversaries and lists of "
-        "past hacks (Bybit, Ronin, FTX, etc.); weekly or quarterly stats and "
-        "reports; predictions, opinions, fear or speculation (\"could be "
-        "hacked\", \"if X gets hacked\"); questions, replies asking \"is "
-        "this true?\", jokes and memes; ads for audits, bug bounties, wallets "
-        "or security products; giveaways and airdrops; price or market "
-        "commentary or a token crash with no attack claimed; non-crypto "
-        "\"hacks\" (life hacks, growth hacking, hackathons); vague claims "
-        "with no platform and no detail; a single person losing a small "
-        "amount (about under $10k) from their own wallet or account with no "
-        "platform failure behind it.\n\n"
-        "SCORING: 0-24 not an incident. 25-44 weak, vague or unconfirmed "
-        "but plausible. 45-69 specific claim with concrete detail, or a "
-        "credible but smaller incident (under about $1M). 70-100 credible "
-        "AND large or urgent: about $1M or more at stake, a major exchange "
-        "or top protocol, an active ongoing drain, or a trusted account "
-        "giving details. Verified status alone is not proof. Do not inflate "
-        "the score because a tweet sounds dramatic or uses many emojis. "
-        "Tweets from trusted accounts score higher. Trusted: "
-        f"{trusted_list}.\n\n"
-        "EXAMPLES:\n"
-        "- \"Bybit hot wallet drained, ~$1.4B ETH moving to new addresses 0x...\" "
-        "-> real, 90.\n"
-        "- \"Protocol X paused after oracle exploit, ~$3M lost\" -> real, 65.\n"
-        "- \"Lost 2 ETH to a phishing site last night, be careful\" -> "
-        "personal loss, false, 10.\n"
-        "- \"1 year since the Bybit hack, here is what we learned\" -> false, 5.\n"
-        "- \"Top 5 ways to avoid getting drained\" -> false, 3.\n"
-        "- \"Is exchange Y hacked? Withdrawals look slow\" -> question, "
-        "false, 10.\n\n"
+        "(bridged, swapped, mixed, sent to an exchange); attacker address or "
+        "tx hash; an official acknowledgement of a fresh incident. An "
+        "unverified claim from a small account counts if it has concrete "
+        "detail (platform + amount, address, tx hash, specific mechanism).\n"
+        "NOT AN INCIDENT (false, score 0-15):\n"
+        "- security tips, how-to guides, general scam or phishing warnings, "
+        "warnings about scam tokens or fake sites;\n"
+        "- predictions, opinions, fear (\"could be hacked\"), questions, \"is "
+        "this true?\" replies, jokes, memes;\n"
+        "- ads for audits, bug bounties, wallets or security products; "
+        "giveaways, airdrops;\n"
+        "- scheduled maintenance, wallet maintenance, network upgrades, hard "
+        "forks, token migrations, delistings, trading suspended for a token, "
+        "deposits or withdrawals paused for maintenance or regulatory reasons "
+        "(even if the tweet says \"paused\", \"halted\" or \"suspended\");\n"
+        "- whale alerts and big transfers or exchange inflows and outflows "
+        "with no hack claimed;\n"
+        "- price, liquidation or depeg commentary, trading signals, token "
+        "crashes with no attack claimed;\n"
+        "- non-crypto \"hacks\" (life hacks, growth hacking, hackathons);\n"
+        "- a single person losing under about $10k from their own wallet or "
+        "account;\n"
+        "- vague claims with no platform and no detail.\n"
+        "CAPPED AT 30: a vulnerability disclosed or patched with no funds "
+        "lost; an influencer's or small account's X/Telegram hacked to post "
+        "scams (the official account of a major project or exchange being "
+        "hijacked is real).\n\n"
+        "STEP 3 - SCORE: 0-24 not an incident. 25-44 weak, vague or "
+        "unconfirmed but plausible. 45-69 specific claim with concrete "
+        "detail, or a credible smaller incident (under about $1M). 70-100 "
+        "credible AND large or urgent: about $1M or more, a major exchange or "
+        "top protocol, an active ongoing drain, or a trusted account giving "
+        "details. Verified status alone is not proof. Do not inflate a score "
+        "because a tweet is dramatic or full of emojis. Tweets from trusted "
+        f"accounts score higher. Trusted: {trusted_list}.\n\n"
+        "EXAMPLES (tweet -> verdict):\n"
+        "- \"Bybit hot wallet drained, ~$1.4B ETH moving to 0x...\" (posted 5 "
+        "min ago) -> real, 90\n"
+        "- \"Protocol X paused after oracle exploit, ~$3M lost\" -> real, 65\n"
+        "- \"1 year since the $1.4B Bybit hack, lessons learned\" -> false "
+        "(old), 5\n"
+        "- \"Lazarus Group laundering Bybit funds, arrests made\" -> false "
+        "unless new funds are moving today\n"
+        "- \"Exchange Y suspends withdrawals for wallet maintenance\" -> "
+        "false, 8\n"
+        "- \"Top 5 ways to avoid getting drained\" -> false, 3\n"
+        "- \"Is exchange Z hacked? withdrawals feel slow\" -> false "
+        "(question), 10\n"
+        "- \"Lost 2 ETH to a phishing site last night\" -> false "
+        "(personal), 10\n\n"
         "Respond with ONLY valid JSON (no markdown, nothing before or after):\n"
-        '{"reason": "max 20 words: the evidence for your verdict", '
+        '{"evidence": "quote the exact words from the tweet showing it is '
+        "new and concrete, or 'none'\", "
+        '"incident_age": "now | hours | days | old | unknown", '
         '"is_real_incident": true/false, "risk_score": 0-100, '
         '"case_key": "if this is about a case in Known open cases, copy its '
         "key EXACTLY; otherwise up to 3 distinctive lowercase words from the "
@@ -1049,6 +1106,21 @@ def _parse_classification_json(text: str, provider: str):
             summary = summary[:140].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
         case_key = (parsed.get("case_key", "") or "").strip().lower().replace(" ", "_") or "unknown_incident"
         fields = {f: (parsed.get(f, "") or "").strip() for f in CASE_TRACKED_FIELDS}
+        # Extra freshness rules, active only for the stricter prompt (which
+        # asks for these two fields).
+        evidence = str(parsed.get("evidence", "")).strip()
+        incident_age = str(parsed.get("incident_age", "")).strip().lower()
+        if "evidence" in parsed and evidence.lower() in (
+                "", "none", "n/a", "na", "null", "unknown", "no evidence"):
+            if is_real:
+                print("    -> no evidence of a new, concrete incident in the tweet "
+                      "-> treated as not an incident", file=sys.stderr)
+            is_real = False
+        if incident_age == "old":
+            if is_real:
+                print("    -> AI says the incident is old -> treated as not an "
+                      "incident", file=sys.stderr)
+            is_real = False
         if not is_real:
             score = min(score, 15)  # force low if the AI says it's not real
 
@@ -1063,6 +1135,7 @@ def _parse_classification_json(text: str, provider: str):
         return {
             "score": score, "label": label, "summary": summary,
             "case_key": case_key, "fields": fields,
+            "evidence": evidence, "incident_age": incident_age,
         }
 
     except Exception as e:
@@ -1107,7 +1180,10 @@ def classify_with_ai(tweet: dict):
                     else f"Posted: about {mins // 60} hours ago\n")
     except Exception:
         pass
+    now_utc = datetime.now(timezone.utc)
+    age_note = f"Today (UTC): {now_utc.strftime('%Y-%m-%d %H:%M')}\n" + age_note
     user_message = user_message.replace("Tweet text:", age_note + "Tweet text:", 1)
+    open_keys = {k.strip() for k in str(open_cases).split(",")}
 
     for i, (prov, model) in enumerate(attempts):
         pname = AI_PROVIDERS[prov]["name"]
@@ -1119,6 +1195,14 @@ def classify_with_ai(tweet: dict):
                               fast_fail=(i < len(attempts) - 1), provider=prov)
             result = _parse_classification_json(text, f"{pname} ({model})")
             if result:
+                result["provider"] = prov
+                # Incident began days ago: only worth an alert if it is a
+                # case we already track (a fresh development of it).
+                if (result.get("incident_age") == "days" and result["score"] >= 25
+                        and result["case_key"] not in open_keys):
+                    print("    -> incident is days old and not a tracked case -> "
+                          "score capped at 24", file=sys.stderr)
+                    result["score"], result["label"] = 24, "LOW"
                 return result
             raise RuntimeError(f"unreadable reply from {pname}: {text[:200]!r}")
         except Exception as e:
@@ -1126,6 +1210,173 @@ def classify_with_ai(tweet: dict):
             _last_ai_error = str(e)
             print(f"{pname} ({model}) classification failed: {e}", file=sys.stderr)
     return None
+
+
+def _first_json_object(text: str):
+    """Parses the first {...} object in an AI reply, ignoring stray text."""
+    text = (text or "").replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object in reply")
+    obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    return obj
+
+
+def _build_verify_prompt(search: bool) -> str:
+    how = (
+        "Use the X search tool (at most two searches) to look for other posts "
+        "about this platform and event: its official accounts, security "
+        "firms such as PeckShield, CertiK, SlowMist, Cyvers, ZachXBT, and "
+        "when it started. "
+        if search else
+        "You cannot search. Judge from the tweet and your own knowledge; if "
+        "you do not recognise the event, answer unclear. "
+    )
+    return (
+        "You verify crypto security-incident alerts before they reach a "
+        "human. Another AI flagged the tweet below as a NEW incident. "
+        "Today's date (UTC) is in the message. " + how + "\n\n"
+        "Choose a verdict:\n"
+        "- confirmed: a real security incident (hack, exploit, theft, key or "
+        "site compromise, attack-related halt) that began within roughly the "
+        "last 24 hours, or is a fresh development of one, AND other posts, "
+        "official accounts or concrete verifiable detail support it.\n"
+        "- unclear: you found no corroboration, but nothing contradicts it "
+        "either. Very first reports often look like this; use it instead of "
+        "guessing.\n"
+        "- old: it describes an incident that happened before roughly "
+        "yesterday (a rehash, recap, anniversary, or follow-up on a past hack "
+        "with no new event).\n"
+        "- not_incident: maintenance, upgrade, whale or transfer movement, "
+        "opinion, question, scam warning, marketing, price talk, or the "
+        "project/exchange denies it.\n"
+        "Use old or not_incident only with positive evidence, or when the "
+        "tweet itself clearly is one; never just because you found nothing. "
+        "risk_score is your own 0-100 severity (0-24 not an incident, 25-44 "
+        "weak, 45-69 specific and credible, 70-100 large and credible); go "
+        "lower than the first AI if it was inflated.\n\n"
+        "Respond with ONLY valid JSON (nothing before or after):\n"
+        '{"verdict": "confirmed | unclear | old | not_incident", '
+        '"risk_score": 0-100, '
+        '"incident_started": "when it began, e.g. \'2 hours ago\', \'Feb '
+        '2025\', or \'unknown\'", '
+        '"summary": "max 140 chars: \'<Project>: <what\'s happening>\'", '
+        '"note": "max 200 chars: what you found - who else reports it, '
+        'official statement, key facts"}'
+    )
+
+
+def _call_grok_search(system_prompt: str, user_message: str, model: str) -> str:
+    """Grok with the X search tool (xAI Responses API). Up to 2 attempts.
+    Raises on failure. Returns the reply text."""
+    tool = {"type": "x_search"}
+    if GROK_VERIFY_FROM_DAYS > 0:
+        tool["from_date"] = (datetime.now(timezone.utc)
+                             - timedelta(days=GROK_VERIFY_FROM_DAYS)).strftime("%Y-%m-%d")
+    if IGNORED_ACCOUNTS:
+        tool["excluded_x_handles"] = IGNORED_ACCOUNTS[:20]
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "tools": [tool],
+        "max_output_tokens": GROK_VERIFY_MAX_TOKENS,
+    }
+    if GROK_VERIFY_MAX_TURNS > 0:
+        payload["max_turns"] = GROK_VERIFY_MAX_TURNS
+    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    last_error = "unknown"
+    for attempt in range(2):
+        try:
+            resp = requests.post("https://api.x.ai/v1/responses", headers=headers,
+                                 json=payload, timeout=GROK_VERIFY_TIMEOUT_SECONDS)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_error = type(e).__name__
+        else:
+            if resp.ok:
+                data = resp.json()
+                text = data.get("output_text") or ""
+                if not text:
+                    for item in data.get("output", []) or []:
+                        if item.get("type") == "message":
+                            for c in item.get("content", []) or []:
+                                if c.get("type") in ("output_text", "text"):
+                                    text += c.get("text", "")
+                usage = (data.get("usage") or {}).get("server_side_tool_usage_details")
+                print(f"    Grok search used: {usage}")
+                if text.strip():
+                    return text.strip()
+                last_error = f"empty reply (status={data.get('status')})"
+            else:
+                last_error = f"{resp.status_code} from Grok: {resp.text[:300]}"
+                if resp.status_code == 400 and attempt == 0:
+                    # xAI rejected an optional setting: drop whichever one the
+                    # error names and try once more without it.
+                    dropped = [k for k in ("max_turns", "max_output_tokens") if k in resp.text and payload.pop(k, None) is not None]
+                    dropped += [k for k in ("from_date", "excluded_x_handles") if k in resp.text and tool.pop(k, None) is not None]
+                    if dropped:
+                        print(f"    xAI rejected {dropped}; retrying without", file=sys.stderr)
+                        continue
+                if resp.status_code != 429 and resp.status_code < 500:
+                    raise RuntimeError(last_error)
+        if attempt == 0:
+            time.sleep(3)
+    raise RuntimeError(f"gave up: {last_error}")
+
+
+def verify_with_grok(tweet: dict, ai_result: dict):
+    """Asks Grok to double-check a flagged tweet. Returns a dict with keys
+    verdict (confirmed|unclear|old|not_incident), score, summary, note,
+    started — or None if the check failed (the alert then goes out marked
+    as unverified)."""
+    model = GROK_VERIFY_MODEL or GROK_MODEL
+    created_note = ""
+    try:
+        created = datetime.fromisoformat(str(tweet.get("created_at")).replace("Z", "+00:00"))
+        created_note = f"Tweet posted: {max(0, int((datetime.now(timezone.utc) - created).total_seconds() // 60))} minutes ago\n"
+    except Exception:
+        pass
+    user_message = (
+        f"Today (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}\n"
+        f"Tweet author: @{tweet.get('username', 'unknown')}\n"
+        + created_note +
+        f"Tweet text: {tweet['text']}\n\n"
+        f"First AI's verdict: score {ai_result['score']}, incident age "
+        f"'{ai_result.get('incident_age') or 'unknown'}', evidence "
+        f"'{ai_result.get('evidence') or 'n/a'}', summary '{ai_result['summary']}'"
+    )
+    system_prompt = _build_verify_prompt(GROK_VERIFY_SEARCH)
+    try:
+        if GROK_VERIFY_SEARCH:
+            text = _call_grok_search(system_prompt, user_message, model)
+        else:
+            text = _call_grok(system_prompt, user_message, max_tokens=500,
+                              model=model, provider="grok")
+        data = _first_json_object(text)
+        verdict = str(data.get("verdict", "")).strip().lower()
+        if verdict not in ("confirmed", "unclear", "old", "not_incident"):
+            raise ValueError(f"unexpected verdict {verdict!r}")
+        score = max(0, min(100, int(data.get("risk_score", ai_result["score"]))))
+        return {
+            "verdict": verdict, "score": score,
+            "summary": str(data.get("summary", "")).strip()[:160],
+            "note": str(data.get("note", "")).strip()[:240],
+            "started": str(data.get("incident_started", "")).strip()[:60],
+        }
+    except Exception as e:
+        print(f"    Grok verification failed: {e}", file=sys.stderr)
+        return None
+
+
+def _should_verify(tweet: dict, ai_result: dict) -> bool:
+    return bool(
+        GROK_VERIFY and XAI_API_KEY
+        and ai_result.get("provider") != "grok"
+        and ai_result["score"] >= GROK_VERIFY_MIN_SCORE
+        and (tweet.get("username") or "").lower() not in {a.lower() for a in TRUSTED_ACCOUNTS}
+    )
 
 
 # Maps how X writes chain names in "chain:0xaddress" references to the
@@ -1792,6 +2043,43 @@ def _process_tweet(tweet: dict) -> bool:
             _set_case_flag(case_key, "alerted", False)  # not paged yet
         return
 
+    # Second opinion from Grok (see GROK_VERIFY): only for tweets that are
+    # about to be sent as alerts, so repeats and low scores never cost a call.
+    verify_note = ""
+    if _should_verify(tweet, ai_result):
+        v = verify_with_grok(tweet, ai_result)
+        if v is None:
+            verify_note = ("\n\n⚠️ <i>Not double-checked by Grok (check failed) — "
+                           "treat as unverified.</i>")
+        elif v["verdict"] in ("old", "not_incident"):
+            print(f"    -> Grok says {v['verdict']} ({v['started'] or 'n/a'}): "
+                  f"{v['note']} -> alert cancelled")
+            if is_new_case:
+                _set_case_flag(case_key, "alerted", False)
+            return
+        else:
+            if v["verdict"] == "confirmed":
+                score = v["score"]
+                label = ("CRITICAL" if score >= 70 else "HIGH" if score >= 45
+                         else "MEDIUM" if score >= 25 else "LOW")
+                summary = v["summary"] or summary
+                head = "✅ Grok check: confirmed"
+            else:
+                head = "❔ Grok check: couldn't find other reports yet (unconfirmed)"
+            print(f"    Grok verdict: {v['verdict']} score {v['score']} "
+                  f"(started: {v['started'] or 'n/a'}): {v['note']}")
+            if score < MIN_RISK_SCORE_TO_ALERT:
+                print(f"    -> Grok lowered the score below MIN_RISK_SCORE_TO_ALERT "
+                      f"-> alert cancelled")
+                if is_new_case:
+                    _set_case_flag(case_key, "alerted", False)
+                return
+            if v["note"]:
+                verify_note = (f"\n\n<b>{head}</b>\n{html.escape(v['note'])}\n"
+                               f"{html.escape(translate_to_chinese(v['note']))}")
+            else:
+                verify_note = f"\n\n<b>{head}</b>"
+
     if is_new_case:
         zh_text = translate_to_chinese(tweet["text"])
         message = format_alert(tweet, score, label, zh_text, summary)
@@ -1800,7 +2088,7 @@ def _process_tweet(tweet: dict) -> bool:
         print(f"    -> case update: new info in {pretty_fields}")
         message = format_case_update_alert(tweet, score, label, case_key, changed_fields, fields)
 
-    send_telegram_alert(message)
+    send_telegram_alert(message + verify_note)
     # The reminder goes out with the FIRST alert for a case — a brand-new
     # case, or one that was tracked silently earlier (flag alerted=False) and
     # has only now crossed the alert threshold. Cases saved before this
@@ -1878,6 +2166,12 @@ def main():
               "Scoring is AI-only — the bot cannot classify tweets without it.",
               file=sys.stderr)
         sys.exit(1)
+    if GROK_VERIFY and XAI_API_KEY and AI_PROVIDER != "grok":
+        print(f"Grok double-check: ON for scores >= {GROK_VERIFY_MIN_SCORE} "
+              f"({'with X search' if GROK_VERIFY_SEARCH else 'no search'}, model "
+              f"{GROK_VERIFY_MODEL or GROK_MODEL})")
+    else:
+        print("Grok double-check: OFF")
     print("AI order: " + " -> ".join(f"{AI_PROVIDERS[p]['name']} ({m})" for p, m in attempts)
           + ". No live X search.")
 
