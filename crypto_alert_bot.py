@@ -689,6 +689,7 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
     }
     deadline = time.time() + GROK_TOTAL_BUDGET_SECONDS
     last_error = "unknown"
+    partial = ""  # best cut-off reply seen, handed to the rescue parser if all retries fail
     for attempt in range(4):
         gap = GROK_MIN_INTERVAL_SECONDS - (time.time() - _last_grok_call_at)
         if gap > 0:
@@ -705,11 +706,21 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
                 data = resp.json()
                 choice = data["choices"][0]
                 content = (choice["message"].get("content") or "").strip()
-                if content and choice.get("finish_reason") != "length":
+                reason = choice.get("finish_reason")
+                body = content.strip("`").strip()
+                looks_cut = body.startswith("{") and not body.endswith("}")
+                if content and reason in ("stop", None) and not looks_cut:
                     return content
+                # Didn't finish normally: log why (finish_reason tells us whether
+                # DeepSeek ran out of tokens, was filtered, or was interrupted).
+                usage = data.get("usage") or {}
+                print(f"    {pname} reply did not finish normally: finish_reason="
+                      f"{reason}, output tokens={usage.get('completion_tokens')}, "
+                      f"{'ends mid-JSON' if looks_cut else 'complete'}", file=sys.stderr)
+                if content and len(content) > len(partial):
+                    partial = content
                 last_error = (f"{'cut-off' if content else 'empty'} reply from {pname} "
-                              f"(finish_reason={choice.get('finish_reason')}, "
-                              f"usage={data.get('usage')})")
+                              f"(finish_reason={reason}, usage={usage})")
                 resp = None
             # Include the provider's own explanation (spend limit, blocked key,
             # content filter...) — the bare status code hides it.
@@ -728,6 +739,10 @@ def _call_grok(system_prompt: str, user_message: str, max_tokens: int,
             break
         print(f"{pname} {last_error[:60]} — retrying in {wait:.0f}s ({attempt + 1}/3)...", file=sys.stderr)
         time.sleep(wait)
+    if partial:
+        print(f"    {pname}: no complete reply after retries — trying to rescue the "
+              f"cut-off one", file=sys.stderr)
+        return partial
     raise RuntimeError(f"gave up after retries: {last_error}")
 
 
@@ -1102,6 +1117,35 @@ def _build_smart_prompt(trusted_list: str) -> str:
     )
 
 
+def _loose_json_fields(text: str) -> dict:
+    """Reads '"key": value' pairs from almost-JSON whose string values contain
+    unescaped quotes. Each value runs up to the next '", "key":' or the final
+    '}'. Returns {} if nothing usable was found."""
+    out = {}
+    body = text.strip().rstrip("`").strip()
+    if body.endswith("}"):
+        body = body[:-1]
+    keys = list(re.finditer(r'"([a-z_]+)"\s*:\s*', body))
+    for i, km in enumerate(keys):
+        end = keys[i + 1].start() if i + 1 < len(keys) else len(body)
+        raw = body[km.end():end].strip().rstrip(",").strip()
+        if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            val = raw[1:-1].replace('\\"', '"')
+        elif raw.startswith('"'):  # cut-off string value (reply ended mid-text)
+            val = raw[1:].replace('\\"', '"').rstrip("\\") + "…"
+        elif raw.lower() in ("true", "false"):
+            val = raw.lower() == "true"
+        elif raw.startswith("["):
+            try:
+                val = json.loads(raw)
+            except Exception:
+                val = raw.strip("[]")
+        else:
+            val = raw
+        out[km.group(1)] = val
+    return out if "risk_score" in out else {}
+
+
 def _parse_classification_json(text: str, provider: str):
     """
     Shared JSON parsing/repair for classify_with_ai()'s response, used by
@@ -1131,7 +1175,34 @@ def _parse_classification_json(text: str, provider: str):
                 text,
                 flags=re.DOTALL,
             )
-            parsed, _end = json.JSONDecoder().raw_decode(repaired)  # raises if still broken
+            try:
+                parsed, _end = json.JSONDecoder().raw_decode(repaired)
+            except json.JSONDecodeError:
+                # Last resort: a value contains unescaped quotes, e.g.
+                # "summary": "Binance: "post-mortem" out". Pull each
+                # "key": value pair out by position instead of strict JSON.
+                parsed = _loose_json_fields(text)
+                if not parsed:
+                    raise
+
+        # Models sometimes return a list ("hacker_addresses": ["0x..", ..]),
+        # a number or null instead of a string. Normalise everything to text.
+        def _txt(v):
+            if v is None:
+                return ""
+            if isinstance(v, (list, tuple)):
+                return ", ".join(_txt(x) for x in v if x is not None)
+            if isinstance(v, dict):
+                return ", ".join(f"{k}: {_txt(x)}" for k, x in v.items())
+            return str(v)
+        raw_real = parsed.get("is_real_incident", False)
+        parsed = {k: (v if k in ("risk_score",) else _txt(v)) for k, v in parsed.items()}
+        parsed["is_real_incident"] = (raw_real if isinstance(raw_real, bool)
+                                      else str(raw_real).strip().lower() == "true")
+        try:
+            parsed["risk_score"] = int(float(str(parsed.get("risk_score", 0)).strip() or 0))
+        except ValueError:
+            parsed["risk_score"] = 0
 
         score = max(0, min(100, int(parsed.get("risk_score", 0))))
         is_real = bool(parsed.get("is_real_incident", False))
@@ -1718,8 +1789,24 @@ def _readable_ai_error(raw: str) -> str:
     return (raw or "unknown error").strip()[:300]
 
 
+# Page about AI failures only after this many tweets fail IN A ROW; a single
+# hiccup is retried on the next poll anyway.
+AI_FAILURE_ALERT_AFTER = int(os.environ.get("AI_FAILURE_ALERT_AFTER", "3"))
+_ai_consecutive_failures = 0
+
+
+def note_ai_success():
+    global _ai_consecutive_failures
+    _ai_consecutive_failures = 0
+
+
 def note_ai_failure_and_maybe_alert():
-    global _last_ai_failure_alert_at
+    global _last_ai_failure_alert_at, _ai_consecutive_failures
+    _ai_consecutive_failures += 1
+    if _ai_consecutive_failures < AI_FAILURE_ALERT_AFTER:
+        print(f"    (AI failure {_ai_consecutive_failures} in a row — health alert after "
+              f"{AI_FAILURE_ALERT_AFTER})", file=sys.stderr)
+        return
     now = datetime.now(timezone.utc)
     cooldown_elapsed = (
         _last_ai_failure_alert_at is None
@@ -1728,7 +1815,8 @@ def note_ai_failure_and_maybe_alert():
     if cooldown_elapsed:
         reason = _readable_ai_error(_last_ai_error)
         send_system_alert(
-            f"{AI_PROVIDERS.get(AI_PROVIDER, AI_PROVIDERS['grok'])['name']} classification is failing. Tweets are queued and retried "
+            f"{AI_PROVIDERS.get(AI_PROVIDER, AI_PROVIDERS['grok'])['name']} classification is failing "
+            f"({_ai_consecutive_failures} tweets in a row). Tweets are queued and retried "
             f"for about {AI_MAX_ATTEMPTS_PER_TWEET} polls, then dropped, so you "
             "may miss incidents until this recovers.\n\n"
             f"<b>AI says:</b> {html.escape(reason)}\n\n"
@@ -2011,6 +2099,7 @@ def _process_tweet(tweet: dict) -> bool:
         return True  # retry later
 
     mark_tweet_processed(tweet["id"])
+    note_ai_success()
 
     score = ai_result["score"]
     label = ai_result["label"]
