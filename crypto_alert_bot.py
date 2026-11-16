@@ -1022,7 +1022,11 @@ def _build_smart_prompt(trusted_list: str) -> str:
         "STEP 1 - LABEL THE TWEET (tweet_type). Pick exactly one:\n"
         "- first_report: first news that a platform is being or was just "
         "attacked (drained, exploited, hacked, keys or site compromised, "
-        "withdrawals halted because of an attack).\n"
+        "withdrawals halted because of an attack). ALSO first_report: a "
+        "major exchange abruptly halting or suspending deposits and/or "
+        "withdrawals of a token (or a chain or network) with NO harmless "
+        "reason stated in the tweet. Such halts are often the first visible "
+        "sign of an exploit, so score them 45-55.\n"
         "- live_update: new facts about an attack that is still unfolding "
         "right now (more funds drained, more chains hit, platform still "
         "down).\n"
@@ -1054,10 +1058,11 @@ def _build_smart_prompt(trusted_list: str) -> str:
         "tokens or fake sites; predictions, opinions, fear (\"could be "
         "hacked\"), questions, \"is this true?\" replies, jokes, memes; ads "
         "for audits, bug bounties, wallets or security products; giveaways, "
-        "airdrops; scheduled maintenance, wallet maintenance, upgrades, hard "
-        "forks, token migrations, delistings, deposits or withdrawals paused "
-        "for maintenance or regulatory reasons (even if it says \"paused\", "
-        "\"halted\" or \"suspended\"); whale alerts and big transfers with no "
+        "airdrops; deposits or withdrawals paused for a harmless reason that "
+        "the tweet STATES (scheduled maintenance, wallet maintenance, "
+        "network upgrade, hard fork, token migration, delisting, regulatory "
+        "order) - \"temporarily suspended\" or \"network support suspended\" "
+        "with no reason given is NOT a stated reason; whale alerts and big transfers with no "
         "hack claimed; price, liquidation or depeg talk with no attack "
         "claimed; non-crypto \"hacks\" (life hacks, growth hacking, "
         "hackathons); one person losing under about $10k from their own "
@@ -1070,7 +1075,13 @@ def _build_smart_prompt(trusted_list: str) -> str:
         "concrete detail, or a credible smaller incident (under about $1M). "
         "70-100 credible AND large or urgent: about $1M or more, a major "
         "exchange or top protocol, an active ongoing drain, or a trusted "
-        "account giving details. funds_moving tweets score at most 35. "
+        "account giving details. HEDGED REPORTS: words like \"may have "
+        "been hacked\", \"reportedly\", \"probably\", \"possible exploit\", "
+        "\"not confirmed yet\" do NOT make a first report weak. A tweet that "
+        "names a specific platform as hacked or exploited scores 45-60 if it "
+        "also gives an attacker address, an amount or a sharp price drop, "
+        "and 35-44 without those. Early reports are almost always hedged. "
+        "funds_moving tweets score at most 35. "
         "postmortem_analysis, recap_old, legal_recovery and not_incident "
         "score 0-15. Verified status alone is not proof. Do not inflate a "
         "score because a tweet is dramatic or full of emojis. Tweets from "
@@ -1092,6 +1103,13 @@ def _build_smart_prompt(trusted_list: str) -> str:
         "legal_recovery, 5\n"
         "- \"Exchange Y suspends withdrawals for wallet maintenance\" -> "
         "not_incident, 8\n"
+        "- \"JUST IN: Upbit abruptly halts all KAVA deposits and withdrawals, "
+        "network support temporarily suspended\" (no reason given) -> "
+        "first_report, 50\n"
+        "- \"@Lighter_xyz got hacked, thief wallet 0x232c...\" -> "
+        "first_report, 50\n"
+        "- \"Lighter DEX may have been compromised, reports coming in\" -> "
+        "first_report, 38\n"
         "- \"Is exchange Z hacked? withdrawals feel slow\" -> not_incident, 10"
         "\n\n"
         "Respond with ONLY valid JSON (no markdown, nothing before or after):\n"
@@ -1353,6 +1371,11 @@ def _build_verify_prompt(search: bool) -> str:
         "- not_incident: maintenance, upgrade, whale or transfer movement, "
         "opinion, question, scam warning, marketing, price talk, or the "
         "project/exchange denies it.\n"
+        "If the tweet is about an exchange halting a token's deposits or "
+        "withdrawals without a reason, find out WHY: an exploit, hack or "
+        "abnormal on-chain activity on that token or chain is confirmed; "
+        "announced maintenance or an upgrade is not_incident; nothing found "
+        "is unclear.\n"
         "Use old or not_incident only with positive evidence, or when the "
         "tweet itself clearly is one; never just because you found nothing. "
         "risk_score is your own 0-100 severity (0-24 not an incident, 25-44 "
@@ -2054,6 +2077,60 @@ def mark_tweet_processed(tweet_id: str):
         pass
 
 
+# --- "Many accounts at once" signal -------------------------------------------
+# When BUZZ_MIN_ACCOUNTS different accounts report an incident at the same
+# platform within BUZZ_WINDOW_MINUTES, the tweet is raised to
+# BUZZ_ESCALATE_SCORE even if each tweet scored low on its own, so Grok gets
+# to check it early. Memory only; costs nothing extra on X. BUZZ_MIN_ACCOUNTS=0
+# turns it off.
+BUZZ_MIN_ACCOUNTS = int(os.environ.get("BUZZ_MIN_ACCOUNTS", "3"))
+BUZZ_WINDOW_MINUTES = int(os.environ.get("BUZZ_WINDOW_MINUTES", "15"))
+BUZZ_ESCALATE_SCORE = int(os.environ.get("BUZZ_ESCALATE_SCORE", "50"))
+_buzz: dict[str, list] = {}  # platform word -> [(timestamp, author)]
+BUZZ_TWEET_TYPES = {"first_report", "live_update", "funds_moving", "official_statement"}
+
+
+def _buzz_words(case_key: str, text: str) -> set:
+    """Distinctive words of the AI's case key that also appear in the tweet
+    (the platform name, e.g. 'lighter')."""
+    low = (text or "").lower()
+    return {w for w in re.split(r"[_\W]+", case_key or "")
+            if len(w) >= 3 and w not in _GENERIC_WORDS and w in low}
+
+
+def note_buzz(tweet: dict, ai_result: dict) -> tuple[int, str]:
+    """Records this tweet and returns (number of different accounts that
+    reported the same platform within the window, the platform word)."""
+    if BUZZ_MIN_ACCOUNTS <= 0:
+        return 0, ""
+    ttype = ai_result.get("tweet_type") or ""
+    if ttype and ttype not in BUZZ_TWEET_TYPES:
+        return 0, ""
+    if not ttype and ai_result["score"] < 25:
+        return 0, ""
+    now = time.time()
+    cutoff = now - BUZZ_WINDOW_MINUTES * 60
+    author = (tweet.get("username") or "").lower()
+    best, best_word = 0, ""
+    for w in _buzz_words(ai_result["case_key"], tweet["text"]):
+        entries = [e for e in _buzz.get(w, []) if e[0] >= cutoff]
+        entries.append((now, author))
+        _buzz[w] = entries[-50:]
+        n = len({a for _, a in entries})
+        if n > best:
+            best, best_word = n, w
+    for w in [w for w, e in _buzz.items() if not e or e[-1][0] < cutoff]:
+        _buzz.pop(w, None)
+    return best, best_word
+
+
+# A case Grok rejected is not sent to Grok again for this long, unless a new
+# tweet scores higher than the one Grok rejected (saves xAI cost during a
+# flood of tweets about the same thing).
+GROK_RECHECK_MINUTES = int(os.environ.get("GROK_RECHECK_MINUTES", "5"))
+_grok_rejected: dict[str, tuple] = {}  # case_key -> (timestamp, score Grok saw)
+
+
 def _process_tweet(tweet: dict) -> bool:
     """Handles one tweet. Returns True only if the AI call failed and the
     tweet should be retried on a later poll."""
@@ -2112,6 +2189,15 @@ def _process_tweet(tweet: dict) -> bool:
     # MIN_ENGAGEMENT_FILTER against real traffic.
     print(f"  [{label} {score}/100] {likes} likes @{tweet['username']}: {preview}")
 
+    n_accounts, buzz_word = note_buzz(tweet, ai_result)
+    if (BUZZ_MIN_ACCOUNTS > 0 and n_accounts >= BUZZ_MIN_ACCOUNTS
+            and score < BUZZ_ESCALATE_SCORE):
+        print(f"    -> {n_accounts} different accounts reported '{buzz_word}' in the "
+              f"last {BUZZ_WINDOW_MINUTES} min -> score raised {score} -> "
+              f"{BUZZ_ESCALATE_SCORE}")
+        score = ai_result["score"] = BUZZ_ESCALATE_SCORE
+        label = ai_result["label"] = "HIGH"
+
     if score < MIN_RISK_SCORE_TO_TRACK:
         print(f"    -> skipped (below MIN_RISK_SCORE_TO_TRACK={MIN_RISK_SCORE_TO_TRACK})")
         return
@@ -2131,10 +2217,15 @@ def _process_tweet(tweet: dict) -> bool:
     # giving a later tweet about the same case earlier context to
     # build on. Always updates the case record either way; only the
     # alert itself is gated further below.
+    case_before = get_case(case_key)
     is_new_case, changed_fields = upsert_case(
         case_key, tweet, score, label, summary, fields
     )
-    if not is_new_case and not changed_fields:
+    # A case that was recorded but never paged (scored under the alert bar,
+    # or Grok rejected it) still gets FIRST-alert treatment, so a stronger
+    # tweet about it alerts right away instead of being treated as an update.
+    first_alert_pending = is_new_case or (case_before or {}).get("alerted") is False
+    if not first_alert_pending and not changed_fields:
         print(f"    -> skipped (case '{case_key}' already known, no new "
               f"information in this tweet — recorded to case history anyway)")
         return
@@ -2148,7 +2239,7 @@ def _process_tweet(tweet: dict) -> bool:
     # else that changed is still saved to the case record (for
     # case_report.py) — it just doesn't page you again.
     tweet_type = ai_result.get("tweet_type") or ""
-    if not is_new_case:
+    if not first_alert_pending:
         alert_worthy_changes = [f for f in changed_fields if f in ALERT_WORTHY_UPDATE_FIELDS]
         if not alert_worthy_changes:
             print(f"    -> tracked but not re-alerted (case '{case_key}' updated "
@@ -2179,7 +2270,7 @@ def _process_tweet(tweet: dict) -> bool:
     if score < MIN_RISK_SCORE_TO_ALERT:
         print(f"    -> tracked but not alerted (below MIN_RISK_SCORE_TO_ALERT="
               f"{MIN_RISK_SCORE_TO_ALERT}) — case '{case_key}' updated silently")
-        if is_new_case:
+        if first_alert_pending:
             _set_case_flag(case_key, "alerted", False)  # not paged yet
         return
 
@@ -2188,6 +2279,14 @@ def _process_tweet(tweet: dict) -> bool:
     # verdict of old / not an incident, cancels the alert. Nothing from Grok
     # is added to the alert text — its reasoning goes to the log only. If Grok
     # fails, the alert goes out with DeepSeek's score.
+    rejected = _grok_rejected.get(case_key)
+    if (rejected and _should_verify(tweet, ai_result)
+            and time.time() - rejected[0] < GROK_RECHECK_MINUTES * 60
+            and score <= rejected[1]):
+        print(f"    -> Grok rejected case '{case_key}' "
+              f"{(time.time() - rejected[0]) / 60:.0f} min ago and this tweet "
+              f"scores no higher — not re-checked yet")
+        return
     if _should_verify(tweet, ai_result):
         v = verify_with_grok(tweet, ai_result)
         if v is not None:
@@ -2198,15 +2297,17 @@ def _process_tweet(tweet: dict) -> bool:
                   f"(started: {v['started'] or 'n/a'}): {v['note']}")
             if new_score < MIN_RISK_SCORE_TO_ALERT:
                 print("    -> alert cancelled by Grok")
-                if is_new_case:
+                _grok_rejected[case_key] = (time.time(), score)
+                if first_alert_pending:
                     _set_case_flag(case_key, "alerted", False)
                 return
+            _grok_rejected.pop(case_key, None)
             score = new_score
             label = ("CRITICAL" if score >= 70 else "HIGH" if score >= 45
                      else "MEDIUM" if score >= 25 else "LOW")
             summary = v["summary"] or summary
 
-    if is_new_case:
+    if first_alert_pending:
         zh_text = translate_to_chinese(tweet["text"])
         message = format_alert(tweet, score, label, zh_text, summary)
     else:
@@ -2221,9 +2322,7 @@ def _process_tweet(tweet: dict) -> bool:
     # case, or one that was tracked silently earlier (flag alerted=False) and
     # has only now crossed the alert threshold. Cases saved before this
     # feature have no flag and are treated as already alerted.
-    existing = get_case(case_key) or {}
-    first_alert = is_new_case or existing.get("alerted") is False
-    if first_alert:
+    if first_alert_pending:
         _set_case_flag(case_key, "alerted", True)
         if NEW_CASE_REMINDER:
             send_telegram_alert(NEW_CASE_REMINDER)  # separate chat bubble
