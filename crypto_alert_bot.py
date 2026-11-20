@@ -2293,6 +2293,12 @@ def _process_tweet(tweet: dict) -> bool:
             new_score = 0 if v["verdict"] in ("old", "not_incident") else v["score"]
             if tweet_type == "funds_moving":
                 new_score = min(new_score, FUNDS_MOVING_MAX_SCORE)
+            if v["verdict"] == "unclear" and new_score < MIN_RISK_SCORE_TO_ALERT:
+                # "Unclear" = no corroboration yet, but nothing against it
+                # either (typical for a first report). Grok may lower the
+                # score, but not below the alert bar: only "old" or
+                # "not_incident" cancel an alert.
+                new_score = MIN_RISK_SCORE_TO_ALERT
             print(f"    Grok: {v['verdict']}, score {score} -> {new_score} "
                   f"(started: {v['started'] or 'n/a'}): {v['note']}")
             if new_score < MIN_RISK_SCORE_TO_ALERT:
